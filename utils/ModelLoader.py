@@ -4,7 +4,6 @@ import torch
 from torch import nn
 from safetensors import safe_open
 
-
 class ModelLoader:
     def __init__(self, data_path):
         self.data_path = data_path

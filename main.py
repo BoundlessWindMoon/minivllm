@@ -32,7 +32,6 @@ def main():
     msg = "Hello, my name is "
     
     loader = ModelLoader(data_path)
-    
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     config = AutoConfig.from_pretrained(model_path)
     model_skeleton = AutoModelForCausalLM.from_config(config).to(device)
