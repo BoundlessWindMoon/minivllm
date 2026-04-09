@@ -4,30 +4,10 @@ from glob import glob
 from torch import nn
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from utils.ModelLoader import ModelLoader
 
 device = "cuda:0"
 max_new_tokens = 128
-
-def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
-    param.data.copy_(loaded_weight)
-
-def load_model(model: nn.Module, path: str):
-    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
-    for file in glob(os.path.join(path, "*.safetensors")):
-        with safe_open(file, "pt", "cpu") as f:
-            for weight_name in f.keys():
-                for k in packed_modules_mapping:
-                    if k in weight_name:
-                        v, shard_id = packed_modules_mapping[k]
-                        param_name = weight_name.replace(k, v)
-                        param = model.get_parameter(param_name)
-                        weight_loader = getattr(param, "weight_loader")
-                        weight_loader(param, f.get_tensor(weight_name), shard_id)
-                        break
-                else:
-                    param = model.get_parameter(weight_name)
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, f.get_tensor(weight_name))
 
 def compute_logits(model, input_ids: torch.Tensor, position: torch.Tensor, is_prefill: bool) -> torch.Tensor:
     outputs = model(
@@ -47,13 +27,16 @@ def post_process(input_ids: torch.Tensor, position: torch.Tensor, logits: torch.
 
 def main():
     model_path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    data_path = model_path 
     
     msg = "Hello, my name is "
     
+    loader = ModelLoader(data_path)
+    
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     config = AutoConfig.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(model_path, config=config).to(device)
-    load_model(model, model_path)
+    model_skeleton = AutoModelForCausalLM.from_config(config).to(device)
+    model = loader.inject_data(model_skeleton)
     
     print(model)
     
