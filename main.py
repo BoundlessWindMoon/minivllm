@@ -37,33 +37,7 @@ def main():
     
     model_skeleton = Qwen3ForCausalLM(config).to(device)
     
-    # print("=== 数据注入前 ===")
-    # print("嵌入层权重形状:", model_skeleton.model.embed_tokens.weight.shape)
-    # print("嵌入层权重均值:", model_skeleton.model.embed_tokens.weight.mean().item())
-    
-    # if hasattr(model_skeleton.model.layers[0], 'self_attn'):
-    #     attn = model_skeleton.model.layers[0].self_attn
-    #     if hasattr(attn, 'qkv_proj'):
-    #         print("QKV投影层权重形状:", attn.qkv_proj.weight.shape)
-    #         print("QKV投影层权重均值:", attn.qkv_proj.weight.mean().item())
-    
-    # print("输出层权重形状:", model_skeleton.lm_head.weight.shape)
-    # print("输出层权重均值:", model_skeleton.lm_head.weight.mean().item())
-    
     model = loader.inject_data(model_skeleton)
-    
-    # print("=== 数据注入后 ===")
-    # print("嵌入层权重形状:", model_skeleton.model.embed_tokens.weight.shape)
-    # print("嵌入层权重均值:", model_skeleton.model.embed_tokens.weight.mean().item())
-    
-    # if hasattr(model_skeleton.model.layers[0], 'self_attn'):
-    #     attn = model_skeleton.model.layers[0].self_attn
-    #     if hasattr(attn, 'qkv_proj'):
-    #         print("QKV投影层权重形状:", attn.qkv_proj.weight.shape)
-    #         print("QKV投影层权重均值:", attn.qkv_proj.weight.mean().item())
-    
-    # print("输出层权重形状:", model_skeleton.lm_head.weight.shape)
-    # print("输出层权重均值:", model_skeleton.lm_head.weight.mean().item())
     
     inputs = tokenizer(msg, return_tensors="pt").to(device)
     input_ids = inputs["input_ids"].to(device)
