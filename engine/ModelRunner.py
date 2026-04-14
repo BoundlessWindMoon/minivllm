@@ -8,12 +8,12 @@ class ModelRunner:
     @torch.inference_mode()  
     def compute_logits(self, input_ids: torch.Tensor, position: torch.Tensor, is_prefill: bool) -> torch.Tensor:
 
-        hidden_states = self.model(
+        logits = self.model(
             input_ids=input_ids.to(self.device),
             positions=position.to(self.device),
         )
         
-        logits = self.model.compute_logits(hidden_states)
+        # logits = self.model.compute_logits(hidden_states)
         return logits
 
     def post_process(self, input_ids: torch.Tensor, position: torch.Tensor, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

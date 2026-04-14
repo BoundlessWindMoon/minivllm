@@ -539,9 +539,10 @@ class Qwen3ForCausalLM(nn.Module):
         config: Qwen3Config
     ) -> None:
         super().__init__()
-        self.model = Qwen3Model(config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        if config.tie_word_embeddings:
+        self.config = config
+        self.model = Qwen3Model(self.config)
+        self.lm_head = ParallelLMHead(self.config.vocab_size, self.config.hidden_size)
+        if self.config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
     def forward(
@@ -549,10 +550,7 @@ class Qwen3ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        hidden_states = self.model(input_ids, positions)
+        logits = self.lm_head(hidden_states)
+        return logits
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.lm_head(hidden_states)

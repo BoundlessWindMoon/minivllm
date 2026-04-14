@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.distributed as dist
+# import swanlab
 from glob import glob
 from torch import nn
 from safetensors import safe_open
@@ -8,7 +9,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from utils.ModelLoader import ModelLoader
 from engine.ModelRunner import ModelRunner
 from model.qwen3 import Qwen3ForCausalLM
-
 
 device = "cuda:0"
 max_new_tokens = 128
@@ -38,6 +38,7 @@ def main():
     model_skeleton = Qwen3ForCausalLM(config).to(device)
     
     model = loader.inject_data(model_skeleton)
+    print(model)
     
     inputs = tokenizer(msg, return_tensors="pt").to(device)
     input_ids = inputs["input_ids"].to(device)
@@ -45,6 +46,14 @@ def main():
     
     runner = ModelRunner(model, device)
 
+    # swanlab.init(
+    #     project="nanovllm-sakuya",
+        
+    #     config={
+    #         "architecture": "Qwen3-0.6B"
+    #     }    
+    # )
+    
     # prefill
     logits = runner.compute_logits(input_ids, position_ids, is_prefill=True)
     
@@ -53,11 +62,12 @@ def main():
     while(current_tokens < max_new_tokens):
         logits = runner.compute_logits(input_ids, position_ids, is_prefill=False)
         input_ids, position_ids = runner.post_process(input_ids, position_ids, logits)
+        swanlab.log({"currents_tokens": current_tokens})
         current_tokens += 1
 
     current_text = tokenizer.decode(input_ids[0])
     print(f"当前生成: {current_text}")
-    
+    # swanlab.finish()
 
 if __name__ == "__main__":
     main()
