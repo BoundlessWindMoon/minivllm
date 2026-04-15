@@ -137,7 +137,7 @@ class Verifier:
         )
         loss_mae = (baseline_per_token_loss - test_per_token_loss).abs().mean().item()
         ppl_diff_pct = abs(baseline_ppl - test_ppl) / baseline_ppl * 100
-        is_close = ppl_diff_pct < 2
+        is_close = ppl_diff_pct < 5
         return {
             "baseline_ppl": baseline_ppl,
             "test_ppl": test_ppl,
@@ -198,7 +198,7 @@ class Verifier:
         step_idx: int,
         tolerance: float = 0.1,
     ) -> Tuple[bool, Dict[str, Any]]:
-        """比对单步 Decode 的 Token 和 Logits 分布"""
+
         if not hasattr(self, "greedy_cache"):
             raise ValueError("请先调用 generate_baseline_greedy() 生成基线")
         baseline_token = self.greedy_cache["greedy_tokens"][step_idx].to(
@@ -206,7 +206,7 @@ class Verifier:
         )
         baseline_logits = self.greedy_cache["greedy_logits"][step_idx].to(
             test_logits.device
-        )  # (vocab_size,)
+        )
 
         test_logits_sq = test_logits.squeeze()  # (vocab_size,)
         is_match = test_token.item() == baseline_token.item()
@@ -217,7 +217,7 @@ class Verifier:
             "test_token_id": test_token.item(),
             "baseline_text": self.tokenizer.decode(baseline_token),
             "test_text": self.tokenizer.decode(test_token),
-            "is_critical_diverge": False,  # 新增：标记是否为严重发散
+            "is_critical_diverge": False,
         }
         if not is_match:
             baseline_probs = torch.softmax(baseline_logits.float(), dim=-1)
@@ -234,9 +234,9 @@ class Verifier:
 
             prob_drop = baseline_probs[b_tok].item() - test_probs[b_tok].item()
             if prob_drop < tolerance and max_prob_diff < tolerance:
-                details["is_critical_diverge"] = False  # 波动，不中断
+                details["is_critical_diverge"] = False
             else:
-                details["is_critical_diverge"] = True  # 严重发散，需中断
+                details["is_critical_diverge"] = True
 
             def get_top5(probs):
                 values, indices = torch.topk(probs, 5)

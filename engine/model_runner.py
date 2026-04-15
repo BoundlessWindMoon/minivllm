@@ -25,6 +25,7 @@ class ModelRunner:
         baseline_model_path: Optional[str] = None,
         baseline_model_dtype: Optional[torch.dtype] = torch.bfloat16,
         device="cuda:0",
+        profile_dir: str = "./log/profile/",
     ):
         self.model = model
         self.device = device
@@ -32,7 +33,7 @@ class ModelRunner:
         self.use_profile = use_profile
         self.tokenizer = tokenizer
         self.max_new_tokens = max_new_tokens
-
+        self.profile_dir = profile_dir
         self.prompt = prompt
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
         self.input_ids = inputs["input_ids"].to(self.device)
@@ -61,19 +62,41 @@ class ModelRunner:
                 device=device,
             )
 
+        self.prof = None
+        if self.use_profile:
+            schedule = torch.profiler.schedule(wait=1, warmup=1, active=1, repeat=2)
+            self.prof = torch.profiler.profile(
+                schedule=schedule,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    self.profile_dir
+                ),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            )
+            logger.info(
+                f"[Profiler] Enabled. Trace will be saved to {self.profile_dir}"
+            )
+
     @torch.inference_mode()
     def inference(self) -> str:
         max_new_tokens = self.max_new_tokens
         tokenizer = self.tokenizer
         input_ids = self.input_ids
         position_ids = self.position_ids
-        if self.use_profile:
-            pass
-        else:
+
+        from contextlib import nullcontext
+
+        with self.prof if self.prof else nullcontext():
+
             # ==========================================
             # 1. Prefill 阶段 & PPL 验证
             # ==========================================
             logits = self.run(input_ids, position_ids, is_prefill=True)
+
+            if self.prof:
+                self.prof.step()
+
             if self.check_correction and self.verifier is not None:
                 logger.info("[ModelRunner] 计算 baseline PPL...")
                 self.verifier.compute_baseline_ppl(self.prompt)
@@ -100,13 +123,15 @@ class ModelRunner:
             while current_tokens < max_new_tokens:
                 logits = self.run(input_ids, position_ids, is_prefill=False)
 
-                next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                if self.prof:
+                    self.prof.step()
 
                 if (
                     self.check_correction
                     and self.verifier is not None
                     and not decode_pass
                 ):
+                    next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
                     is_match, details = self.verifier.verify_decode_step(
                         logits[:, -1, :], next_token.squeeze(), current_tokens
                     )
