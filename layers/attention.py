@@ -3,6 +3,7 @@ from torch import nn
 import triton
 import triton.language as tl
 
+from utils.logger import logger
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from utils.context import get_context
 
@@ -57,43 +58,76 @@ class Attention(nn.Module):
         head_dim,
         scale,
         num_kv_heads,
+        max_position,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
-        self.k_cache = self.v_cache = torch.tensor([])
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        # 兼容 3D 输入，统一转换为 4D: (batch, seq_len, num_heads, head_dim)
-        if q.dim() == 3:
-            q = q.unsqueeze(0)
-        if k.dim() == 3:
-            k = k.unsqueeze(0)
-        if v.dim() == 3:
-            v = v.unsqueeze(0)
-        # 转换为 的格式
+        self.max_position = max_position
+        self.batch_size = 1
+        self.register_buffer(
+            "k_cache",
+            torch.zeros(
+                self.batch_size, self.num_kv_heads, self.max_position, self.head_dim
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "v_cache",
+            torch.zeros(
+                self.batch_size, self.num_kv_heads, self.max_position, self.head_dim
+            ),
+            persistent=False,
+        )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ):
+        ctx = get_context()
+        if ctx:
+            is_prefill = ctx.is_prefill
+            cache_len = ctx.cache_len
+        else:
+            logger.error("ctx is not available.")
+            raise RuntimeError("ctx is not available.")
+
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        # 处理 GQA
+
+        seq_len = q.shape[2]
+        self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
+        self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
+
+        if is_prefill:
+            k_for_attn = k
+            v_for_attn = v
+        else:
+            k_for_attn = self.k_cache[:, :, : cache_len + seq_len, :]
+            v_for_attn = self.v_cache[:, :, : cache_len + seq_len, :]
+
         n_rep = self.num_heads // self.num_kv_heads
         if n_rep > 1:
-            k = k.repeat_interleave(n_rep, dim=1)
-            v = v.repeat_interleave(n_rep, dim=1)
-        # 原始缩放点积注意力计算
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        # 构造因果掩码
+            k_for_attn = k_for_attn.repeat_interleave(n_rep, dim=1)
+            v_for_attn = v_for_attn.repeat_interleave(n_rep, dim=1)
+
+        attn_weights = torch.matmul(q, k_for_attn.transpose(-2, -1)) * self.scale
+
         seq_len_q = q.shape[2]
-        seq_len_k = k.shape[2]
+        seq_len_k = k_for_attn.shape[2]
         causal_mask = torch.triu(
             torch.ones(seq_len_q, seq_len_k, device=q.device, dtype=torch.bool),
             diagonal=seq_len_k - seq_len_q + 1,
         )
         attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
         attn_weights = torch.softmax(attn_weights, dim=-1)
-        o = torch.matmul(attn_weights, v)
-        # 转换回 (batch, seq_len, num_heads, head_dim)
+        o = torch.matmul(attn_weights, v_for_attn)
+
         o = o.transpose(1, 2)
         return o

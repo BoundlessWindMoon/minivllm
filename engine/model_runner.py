@@ -2,6 +2,8 @@ import torch
 import warnings
 
 from utils.logger import logger
+from utils.context import get_context, set_context
+
 
 try:
     from utils.verifier import Verifier
@@ -22,6 +24,7 @@ class ModelRunner:
         prompt="",
         check_correction=False,
         use_profile=False,
+        use_kvcache=True,
         baseline_model_path: Optional[str] = None,
         baseline_model_dtype: Optional[torch.dtype] = torch.bfloat16,
         device="cuda:0",
@@ -31,6 +34,7 @@ class ModelRunner:
         self.device = device
         self.check_correction = check_correction
         self.use_profile = use_profile
+        self.use_kvcache = use_kvcache
         self.tokenizer = tokenizer
         self.max_new_tokens = max_new_tokens
         self.profile_dir = profile_dir
@@ -78,6 +82,12 @@ class ModelRunner:
                 f"[Profiler] Enabled. Trace will be saved to {self.profile_dir}"
             )
 
+        if not self.use_kvcache:
+            logger.error(
+                f"KVCACHE is not enabled, please enable it for better performance"
+            )
+            assert self.use_kvcache == True
+
     @torch.inference_mode()
     def inference(self) -> str:
         max_new_tokens = self.max_new_tokens
@@ -88,11 +98,20 @@ class ModelRunner:
         from contextlib import nullcontext
 
         with self.prof if self.prof else nullcontext():
+            prompt_seq_len = input_ids.shape[1]
+            past_len = 0
+            generated_ids = []
 
             # ==========================================
             # 1. Prefill 阶段 & PPL 验证
             # ==========================================
-            logits = self.run(input_ids, position_ids, is_prefill=True)
+            cu_seqlens_q_prefill = torch.tensor(
+                [0, prompt_seq_len], dtype=torch.long, device=self.device
+            )
+            set_context(
+                is_prefill=True, cache_len=past_len, cu_seqlens_q=cu_seqlens_q_prefill
+            )
+            logits = self.run(input_ids, position_ids)
 
             if self.prof:
                 self.prof.step()
@@ -109,6 +128,10 @@ class ModelRunner:
                         "模型在 Prefill 阶段仅返回了最后一个 token 的 logits, 无法计算 PPL。"
                     )
 
+            next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            generated_ids.append(next_token.item())
+            past_len += prompt_seq_len
+
             # ==========================================
             # 2. Decode 阶段 & 贪婪解码验证
             # ==========================================
@@ -119,21 +142,34 @@ class ModelRunner:
 
             current_tokens = 0
             decode_pass = False
-
+            cu_seqlens_q_decode = torch.tensor(
+                [0, 1], dtype=torch.long, device=self.device
+            )
             while current_tokens < max_new_tokens:
-                logits = self.run(input_ids, position_ids, is_prefill=False)
+                set_context(
+                    is_prefill=False,
+                    cache_len=past_len,
+                    cu_seqlens_q=cu_seqlens_q_decode,
+                )
+
+                decoder_input_ids = next_token
+                decoder_position_ids = torch.tensor(
+                    [[past_len]], device=self.device, dtype=torch.long
+                )
+
+                logits = self.run(decoder_input_ids, decoder_position_ids)
 
                 if self.prof:
                     self.prof.step()
 
+                next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
                 if (
                     self.check_correction
                     and self.verifier is not None
                     and not decode_pass
                 ):
-                    next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
                     is_match, details = self.verifier.verify_decode_step(
-                        logits[:, -1, :], next_token.squeeze(), current_tokens
+                        logits[:, -1, :], next_token.squeeze(), current_tokens + 1
                     )
 
                     if not is_match:
@@ -156,9 +192,8 @@ class ModelRunner:
                                 self.verification_results
                             )
                             break
-                input_ids, position_ids = self.post_process(
-                    input_ids, position_ids, logits
-                )
+                generated_ids.append(next_token.item())
+                past_len += 1
                 current_tokens += 1
 
             if (
@@ -169,12 +204,16 @@ class ModelRunner:
                 if "decode_diverge" not in self.verification_results:
                     self.verification_results["decode_diverge"] = {"is_match": True}
                 self.verifier.print_verification_report(self.verification_results)
-        text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+        text = tokenizer.decode(
+            input_ids[0], skip_special_tokens=True
+        ) + tokenizer.decode(generated_ids, skip_special_tokens=True)
         return text
 
     @torch.inference_mode()
     def run(
-        self, input_ids: torch.Tensor, position_ids: torch.Tensor, is_prefill: bool
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
     ) -> torch.Tensor:
         return self.model(input_ids, position_ids)
 

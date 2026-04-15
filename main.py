@@ -43,6 +43,7 @@ def main():
         max_new_tokens=max_new_tokens,
         check_correction=True,
         use_profile=False,
+        use_kvcache=True,
         baseline_model_path=baseline_model_path,
     )
 

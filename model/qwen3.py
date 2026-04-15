@@ -68,6 +68,7 @@ class Qwen3Attention(nn.Module):
             self.head_dim,
             self.scaling,
             self.num_kv_heads,
+            max_position=max_position,
         )
         if not self.qkv_bias:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
