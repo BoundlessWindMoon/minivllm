@@ -59,26 +59,27 @@ class Attention(nn.Module):
         scale,
         num_kv_heads,
         max_position,
+        max_seq_len: int = 4096,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
-
+        self.max_seq_len = max_seq_len
         self.max_position = max_position
         self.batch_size = 1
         self.register_buffer(
             "k_cache",
             torch.zeros(
-                self.batch_size, self.num_kv_heads, self.max_position, self.head_dim
+                self.batch_size, self.num_kv_heads, self.max_seq_len, self.head_dim
             ),
             persistent=False,
         )
         self.register_buffer(
             "v_cache",
             torch.zeros(
-                self.batch_size, self.num_kv_heads, self.max_position, self.head_dim
+                self.batch_size, self.num_kv_heads, self.max_seq_len, self.head_dim
             ),
             persistent=False,
         )

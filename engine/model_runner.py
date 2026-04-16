@@ -3,7 +3,8 @@ import warnings
 
 from utils.logger import logger
 from utils.context import get_context, set_context
-
+from utils.progress import InferenceProgress
+from utils.sampler import Sampler
 
 try:
     from utils.verifier import Verifier
@@ -20,11 +21,16 @@ class ModelRunner:
         self,
         model,
         tokenizer,
-        max_new_tokens=128,
+        max_new_tokens,
         prompt="",
         check_correction=False,
         use_profile=False,
         use_kvcache=True,
+        use_progress=True,
+        sample_method: Optional[str] = "greedy",
+        temperature: Optional[float] = 1.0,
+        topk: int = 1,
+        topp: float = 1.0,
         baseline_model_path: Optional[str] = None,
         baseline_model_dtype: Optional[torch.dtype] = torch.bfloat16,
         device="cuda:0",
@@ -35,7 +41,12 @@ class ModelRunner:
         self.check_correction = check_correction
         self.use_profile = use_profile
         self.use_kvcache = use_kvcache
+        self.use_progress = use_progress
         self.tokenizer = tokenizer
+        self.sample_method = sample_method
+        self.temperature = temperature
+        self.topk = topk
+        self.topp = topp
         self.max_new_tokens = max_new_tokens
         self.profile_dir = profile_dir
         self.prompt = prompt
@@ -50,6 +61,17 @@ class ModelRunner:
 
         self.verifier = None
         self.verification_results = {}
+
+        self.sampler = Sampler(
+            self.sample_method, self.temperature, top_k=self.topk, top_p=self.topp
+        )
+        if sample_method != "greedy":
+            self.check_correction = False
+            logger.warning(
+                f"Only greedy sampling method supports correction, so correction is disabled."
+            )
+        else:
+            logger.error(f"Sample method is not set, please set it")
 
         if self.check_correction:
             if not VERIFIER_AVAILABLE:
@@ -94,116 +116,123 @@ class ModelRunner:
         tokenizer = self.tokenizer
         input_ids = self.input_ids
         position_ids = self.position_ids
-
+        prompt_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
         from contextlib import nullcontext
 
-        with self.prof if self.prof else nullcontext():
-            prompt_seq_len = input_ids.shape[1]
-            past_len = 0
-            generated_ids = []
+        with InferenceProgress(tokenizer, max_new_tokens, prompt_text) as pbar:
+            with self.prof if self.prof else nullcontext():
+                prompt_seq_len = input_ids.shape[1]
+                past_len = 0
+                generated_ids = []
 
-            # ==========================================
-            # 1. Prefill 阶段 & PPL 验证
-            # ==========================================
-            cu_seqlens_q_prefill = torch.tensor(
-                [0, prompt_seq_len], dtype=torch.long, device=self.device
-            )
-            set_context(
-                is_prefill=True, cache_len=past_len, cu_seqlens_q=cu_seqlens_q_prefill
-            )
-            logits = self.run(input_ids, position_ids)
-
-            if self.prof:
-                self.prof.step()
-
-            if self.check_correction and self.verifier is not None:
-                logger.info("[ModelRunner] 计算 baseline PPL...")
-                self.verifier.compute_baseline_ppl(self.prompt)
-                logger.info("[ModelRunner] 比对 baseline model PPL...")
-                if logits.shape[1] == input_ids.shape[1]:
-                    ppl_result = self.verifier.verify_ppl(logits, input_ids)
-                    self.verification_results["ppl"] = ppl_result
-                else:
-                    logger.warning(
-                        "模型在 Prefill 阶段仅返回了最后一个 token 的 logits, 无法计算 PPL。"
-                    )
-
-            next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-            generated_ids.append(next_token.item())
-            past_len += prompt_seq_len
-
-            # ==========================================
-            # 2. Decode 阶段 & 贪婪解码验证
-            # ==========================================
-            if self.check_correction and self.verifier is not None:
-                logger.info("[ModelRunner] 生成 baseline 的 greedy decode 结果...")
-                self.verifier.generate_baseline_greedy(self.prompt, max_new_tokens)
-                logger.info("[ModelRunner] 开始逐 Token 验证 Decode...")
-
-            current_tokens = 0
-            decode_pass = False
-            cu_seqlens_q_decode = torch.tensor(
-                [0, 1], dtype=torch.long, device=self.device
-            )
-            while current_tokens < max_new_tokens:
+                # ==========================================
+                # 1. Prefill 阶段 & PPL 验证
+                # ==========================================
+                pbar.start_prefill()
+                cu_seqlens_q_prefill = torch.tensor(
+                    [0, prompt_seq_len], dtype=torch.long, device=self.device
+                )
                 set_context(
-                    is_prefill=False,
+                    is_prefill=True,
                     cache_len=past_len,
-                    cu_seqlens_q=cu_seqlens_q_decode,
+                    cu_seqlens_q=cu_seqlens_q_prefill,
                 )
-
-                decoder_input_ids = next_token
-                decoder_position_ids = torch.tensor(
-                    [[past_len]], device=self.device, dtype=torch.long
-                )
-
-                logits = self.run(decoder_input_ids, decoder_position_ids)
+                logits = self.run(input_ids, position_ids)
 
                 if self.prof:
                     self.prof.step()
 
-                next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-                if (
-                    self.check_correction
-                    and self.verifier is not None
-                    and not decode_pass
-                ):
-                    is_match, details = self.verifier.verify_decode_step(
-                        logits[:, -1, :], next_token.squeeze(), current_tokens + 1
+                if self.check_correction and self.verifier is not None:
+                    logger.info("[ModelRunner] 计算 baseline PPL...")
+                    self.verifier.compute_baseline_ppl(self.prompt)
+                    logger.info("[ModelRunner] 比对 baseline model PPL...")
+                    if logits.shape[1] == input_ids.shape[1]:
+                        ppl_result = self.verifier.verify_ppl(logits, input_ids)
+                        self.verification_results["ppl"] = ppl_result
+                    else:
+                        logger.warning(
+                            "模型在 Prefill 阶段仅返回了最后一个 token 的 logits, 无法计算 PPL。"
+                        )
+
+                next_token = self.sampler.sample(logits)
+
+                generated_ids.append(next_token.item())
+                past_len += prompt_seq_len
+                pbar.end_prefill(next_token.item())
+                # ==========================================
+                # 2. Decode 阶段 & 贪婪解码验证
+                # ==========================================
+                if self.check_correction and self.verifier is not None:
+                    logger.info("[ModelRunner] 生成 baseline 的 greedy decode 结果...")
+                    self.verifier.generate_baseline_greedy(self.prompt, max_new_tokens)
+                    logger.info("[ModelRunner] 开始逐 Token 验证 Decode...")
+
+                pbar.start_decode()
+                current_tokens = 0
+                decode_pass = False
+                cu_seqlens_q_decode = torch.tensor(
+                    [0, 1], dtype=torch.long, device=self.device
+                )
+                while current_tokens < max_new_tokens:
+                    set_context(
+                        is_prefill=False,
+                        cache_len=past_len,
+                        cu_seqlens_q=cu_seqlens_q_decode,
                     )
 
-                    if not is_match:
-                        if details["max_prob_diff"] < 0.1:
-                            logger.warning(
-                                f"\n[Warning] Step {current_tokens}: baseline 选 '{details['baseline_text']}'({details['prob_baseline_tok_in_baseline']:.4f}), "
-                                f"\ncustom 选 '{details['test_text']}'({details['prob_test_tok_in_test']:.4f})"
-                                f"\nTop-K 分布一致，视为浮点精度问题, Decode 验证通过！"
-                            )
+                    decoder_input_ids = next_token
+                    decoder_position_ids = torch.tensor(
+                        [[past_len]], device=self.device, dtype=torch.long
+                    )
 
-                            details["is_match"] = True
-                            self.verification_results["decode_diverge"] = details
-                            decode_pass = True
-                        else:
-                            logger.error(
-                                f"\n[fatal error] Step {current_tokens}: Token 严重发散！最大概率差: {details['max_prob_diff']:.4f}"
-                            )
-                            self.verification_results["decode_diverge"] = details
-                            self.verifier.print_verification_report(
-                                self.verification_results
-                            )
-                            break
-                generated_ids.append(next_token.item())
-                past_len += 1
-                current_tokens += 1
+                    logits = self.run(decoder_input_ids, decoder_position_ids)
 
-            if (
-                current_tokens == max_new_tokens
-                and self.check_correction
-                and self.verifier is not None
-            ):
-                if "decode_diverge" not in self.verification_results:
-                    self.verification_results["decode_diverge"] = {"is_match": True}
-                self.verifier.print_verification_report(self.verification_results)
+                    if self.prof:
+                        self.prof.step()
+
+                    next_token = self.sampler.sample(logits)
+                    if (
+                        self.check_correction
+                        and self.verifier is not None
+                        and not decode_pass
+                    ):
+                        is_match, details = self.verifier.verify_decode_step(
+                            logits[:, -1, :], next_token.squeeze(), current_tokens + 1
+                        )
+
+                        if not is_match:
+                            if details["max_prob_diff"] < 0.1:
+                                logger.warning(
+                                    f"\n[Warning] Step {current_tokens}: baseline 选 '{details['baseline_text']}'({details['prob_baseline_tok_in_baseline']:.4f}), "
+                                    f"\ncustom 选 '{details['test_text']}'({details['prob_test_tok_in_test']:.4f})"
+                                    f"\nTop-K 分布一致，视为浮点精度问题, Decode 验证通过！"
+                                )
+
+                                details["is_match"] = True
+                                self.verification_results["decode_diverge"] = details
+                                decode_pass = True
+                            else:
+                                logger.error(
+                                    f"\n[fatal error] Step {current_tokens}: Token 严重发散！最大概率差: {details['max_prob_diff']:.4f}"
+                                )
+                                self.verification_results["decode_diverge"] = details
+                                self.verifier.print_verification_report(
+                                    self.verification_results
+                                )
+                                break
+                    generated_ids.append(next_token.item())
+                    past_len += 1
+                    current_tokens += 1
+                    pbar.step_decode(next_token.item())
+
+                if (
+                    current_tokens == max_new_tokens
+                    and self.check_correction
+                    and self.verifier is not None
+                ):
+                    if "decode_diverge" not in self.verification_results:
+                        self.verification_results["decode_diverge"] = {"is_match": True}
+                    self.verifier.print_verification_report(self.verification_results)
         text = tokenizer.decode(
             input_ids[0], skip_special_tokens=True
         ) + tokenizer.decode(generated_ids, skip_special_tokens=True)

@@ -3,6 +3,8 @@ from glob import glob
 import torch
 from torch import nn
 from safetensors import safe_open
+from utils.progress import ModelLoadProgress
+
 
 class ModelLoader:
     def __init__(self, data_path):
@@ -13,19 +15,26 @@ class ModelLoader:
 
     def inject_data(self, model: nn.Module):
         packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
-        for file in glob(os.path.join(self.data_path, "*.safetensors")):
-            with safe_open(file, "pt", "cpu") as f:
-                for weight_name in f.keys():
-                    for k in packed_modules_mapping:
-                        if k in weight_name:
-                            v, shard_id = packed_modules_mapping[k]
-                            param_name = weight_name.replace(k, v)
-                            param = model.get_parameter(param_name)
-                            weight_loader = getattr(param, "weight_loader")
-                            weight_loader(param, f.get_tensor(weight_name), shard_id)
-                            break
-                    else:
-                        param = model.get_parameter(weight_name)
-                        weight_loader = getattr(param, "weight_loader", self.default_weight_loader)
-                        weight_loader(param, f.get_tensor(weight_name))
+
+        with ModelLoadProgress(self.data_path) as pbar:
+            for file in glob(os.path.join(self.data_path, "*.safetensors")):
+                with safe_open(file, "pt", "cpu") as f:
+                    for weight_name in f.keys():
+                        for k in packed_modules_mapping:
+                            if k in weight_name:
+                                v, shard_id = packed_modules_mapping[k]
+                                param_name = weight_name.replace(k, v)
+                                param = model.get_parameter(param_name)
+                                weight_loader = getattr(param, "weight_loader")
+                                weight_loader(
+                                    param, f.get_tensor(weight_name), shard_id
+                                )
+                                break
+                        else:
+                            param = model.get_parameter(weight_name)
+                            weight_loader = getattr(
+                                param, "weight_loader", self.default_weight_loader
+                            )
+                            weight_loader(param, f.get_tensor(weight_name))
+                        pbar.step()
         return model

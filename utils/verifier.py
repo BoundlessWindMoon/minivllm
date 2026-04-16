@@ -147,7 +147,7 @@ class Verifier:
         }
 
     def generate_baseline_greedy(
-        self, prompt: str, max_new_tokens: int = 128
+        self, prompt: str, max_new_tokens: int
     ) -> Dict[str, Any]:
 
         cache_key = self._get_cache_hash(prompt, suffix=f"greedy_{max_new_tokens}")
@@ -161,7 +161,7 @@ class Verifier:
         hf_model = AutoModelForCausalLM.from_pretrained(
             self.baseline_model_path,
             torch_dtype=self.baseline_model_dtype,
-            device_map="auto" if self.device.startswith("cuda") else None,
+            device_map="cuda:0" if self.device.startswith("cuda") else None,
         ).eval()
 
         inputs = self.tokenizer(prompt, return_tensors="pt")

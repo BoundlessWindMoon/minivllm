@@ -10,8 +10,9 @@ from engine.model_runner import ModelRunner
 from model.qwen3 import Qwen3ForCausalLM
 
 device = "cuda:0"
-max_new_tokens = 128
-msg = "Hello my name is sakuya, im 24 year old and study in UCAS University"
+max_new_tokens = 12
+# msg = "Hello my name is sakuya, im 24 year old and study in UCAS University"
+msg = "今天晚上吃什么?"
 model_path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
 baseline_model_path = os.path.expanduser("~/huggingface/baseline/")
 torch.set_default_dtype(torch.bfloat16)
@@ -44,6 +45,10 @@ def main():
         check_correction=True,
         use_profile=False,
         use_kvcache=True,
+        sample_method="",
+        temperature=0.8,
+        topk=50,
+        topp=0.95,
         baseline_model_path=baseline_model_path,
     )
 
