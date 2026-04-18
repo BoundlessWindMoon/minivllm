@@ -10,7 +10,7 @@ from engine.model_runner import ModelRunner
 from model.qwen3 import Qwen3ForCausalLM
 
 device = "cuda:0"
-max_new_tokens = 12
+max_new_tokens = 128
 # msg = "Hello my name is sakuya, im 24 year old and study in UCAS University"
 msg = "今天晚上吃什么?"
 model_path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
