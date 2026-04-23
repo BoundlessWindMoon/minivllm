@@ -18,7 +18,7 @@ from model.qwen3 import Qwen3ForCausalLM
 device = "cuda:0"
 max_new_tokens = 128
 quant_method = "AWQ"
-quant_bits = 8
+quant_bits = 4
 quant_targerts = ["MLP", "ATTENTION"]
 
 msg = "Hello my name is sakuya, im 24 year old and study in UCAS University"

@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import triton
 import triton.language as tl
+import torch.nn.functional as F
 
 from utils.logger import logger
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
@@ -89,7 +90,23 @@ class Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        use_cache: bool = True,
     ):
+        if not use_cache:
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+
+            n_rep = self.num_heads // self.num_kv_heads
+            if n_rep > 1:
+                k = k.repeat_interleave(n_rep, dim=1)
+                v = v.repeat_interleave(n_rep, dim=1)
+
+            o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+            o = o.transpose(1, 2)
+            return o
+
         ctx = get_context()
         if ctx:
             is_prefill = ctx.is_prefill

@@ -14,6 +14,13 @@ from layers.linear import (
 )
 from layers.rotary_embedding import get_rope
 from layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from typing import (
+    List,
+    Union,
+    Iterable,
+    Dict,
+    Optional,
+)
 
 
 class Qwen3Attention(nn.Module):
@@ -78,6 +85,7 @@ class Qwen3Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        use_cache: bool = True,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         qkv = self.qkv_proj(hidden_states)
@@ -92,7 +100,7 @@ class Qwen3Attention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
+        o = self.attn(q, k, v, use_cache=use_cache)
         # 修改 flatten 维度，输出形状保持 (batch, seq_len, hidden_size)
         output = self.o_proj(o.flatten(2, -1))
         return output
@@ -160,12 +168,13 @@ class Qwen3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        use_cache: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states = self.self_attn(positions, hidden_states, use_cache=use_cache)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
@@ -219,8 +228,12 @@ class Qwen3ForCausalLM(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        positions: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if positions is None:
+            seq_len = input_ids.shape[1]
+            positions = torch.arange(0, seq_len, device=input_ids.device).unsqueeze(0)
+
         hidden_states = self.model(input_ids, positions)
         logits = self.lm_head(hidden_states)
         return logits
