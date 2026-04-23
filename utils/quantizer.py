@@ -2,12 +2,24 @@ import torch
 import torch.nn as nn
 import functools
 
+
 from utils.logger import logger
 from utils.calib_data import get_calib_dataset
 from typing import Dict, List, Optional, Tuple, Union
 
-from tqdm import tqdm
 from collections import defaultdict
+
+from rich.progress import (
+    Progress,
+    BarColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+    MofNCompleteColumn,
+)
+from rich.console import Console
+
+CONSOLE = Console()
 
 from layers.attention import Attention
 from layers.linear import (
@@ -420,53 +432,60 @@ class Quantizer:
 
     def _quantize_and_replace(self):
 
-        for i in tqdm(range(len(self.modules)), desc="AWQ"):
-            self.inps = self.inps.to(self.device)
+        with Progress(
+            TextColumn("[bold blue]🛠️  Quantizing"),
+            BarColumn(bar_width=None),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            TextColumn("• {task.completed}/{task.total} layers"),
+            "•",
+            TimeElapsedColumn(),
+            "<",
+            TimeRemainingColumn(),
+            console=CONSOLE,
+        ) as progress:
+            quant_task = progress.add_task("AWQ", total=len(self.modules))
 
-            # [STEP 1]: Get layer, extract linear modules, extract input features
-            named_linears = model_utils.get_named_linears(self.modules[i])
-
-            input_feat = self._get_input_features(
-                self.modules[i], named_linears, self.layer_kwargs
-            )
-
-            # [STEP 2]: Compute and apply scale list
-            module_config = self.get_layers_for_scaling(
-                self.modules[i], input_feat, self.layer_kwargs
-            )
-
-            scales_list = [
-                self._search_best_scale(self.modules[i], **layer)
-                for layer in module_config
-            ]
-
-            scale_utils.apply_scale(
-                self.modules[i], scales_list, input_feat_dict=input_feat
-            )
-
-            scales_list = model_utils.append_str_prefix(
-                scales_list, model_utils.get_op_name(self.model, self.modules[i]) + "."
-            )
-
-            # [STEP 3]: Compute and apply clipping list
-            if self._apply_clip:
-                clip_list = self._search_best_clip(
-                    self.modules[i], named_linears, input_feat
+            for i in range(len(self.modules)):
+                self.inps = self.inps.to(self.device)
+                # [STEP 1]: Get layer, extract linear modules, extract input features
+                named_linears = model_utils.get_named_linears(self.modules[i])
+                input_feat = self._get_input_features(
+                    self.modules[i], named_linears, self.layer_kwargs
                 )
-                quantize_utils.apply_clip(
-                    self.modules[i], clip_list, model_utils.get_op_by_name
+                # [STEP 2]: Compute and apply scale list
+                module_config = self.get_layers_for_scaling(
+                    self.modules[i], input_feat, self.layer_kwargs
                 )
-                clip_list = model_utils.append_str_prefix(
-                    clip_list,
+                scales_list = [
+                    self._search_best_scale(self.modules[i], **layer)
+                    for layer in module_config
+                ]
+                scale_utils.apply_scale(
+                    self.modules[i], scales_list, input_feat_dict=input_feat
+                )
+                scales_list = model_utils.append_str_prefix(
+                    scales_list,
                     model_utils.get_op_name(self.model, self.modules[i]) + ".",
                 )
+                # [STEP 3]: Compute and apply clipping list
+                if self._apply_clip:
+                    clip_list = self._search_best_clip(
+                        self.modules[i], named_linears, input_feat
+                    )
+                    quantize_utils.apply_clip(
+                        self.modules[i], clip_list, model_utils.get_op_by_name
+                    )
+                    clip_list = model_utils.append_str_prefix(
+                        clip_list,
+                        model_utils.get_op_name(self.model, self.modules[i]) + ".",
+                    )
+                # [STEP 4]: Quantize weights
+                if not self.export_compatible:
+                    self._apply_quant(self.modules[i], named_linears)
 
-            # [STEP 4]: Quantize weights
-            if not self.export_compatible:
-                self._apply_quant(self.modules[i], named_linears)
+                progress.update(quant_task, advance=1)
 
     def run(self):
         self._quantize_and_replace()
-        # quantized_model = self._save_quantized_model()
 
         return self.model

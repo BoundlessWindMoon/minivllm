@@ -1,0 +1,46 @@
+[project]
+name = "mini-vllm"
+version = "0.1.0"
+description = "A lightweight, easy-to-understand inference and quantization engine for LLMs."
+readme = "README.md"
+requires-python = ">=3.10" 
+license = { text = "MIT" }
+
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.40",
+    "accelerate",
+    "safetensors",
+    "datasets",
+    "pyyaml",
+    "dacite",
+    "loguru",
+    "rich",
+    "tqdm",
+    "pydantic",
+    "einops",
+]
+
+
+[project.optional-dependencies]
+quant = [
+    "autoawq",
+]
+profile = [
+    "tensorboard",
+    "scalene",
+]
+monitor = [
+    "swanlab",
+]
+all = [
+    "mini-vllm[quant,profile,monitor]"
+]
+
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["model*", "engine*", "layers*", "utils*", "kernels*"]
