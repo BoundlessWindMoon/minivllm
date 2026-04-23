@@ -8,49 +8,31 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from utils.model_loader import ModelLoader
 from engine.model_runner import ModelRunner
 from model.qwen3 import Qwen3ForCausalLM
-
-device = "cuda:0"
-max_new_tokens = 128
-# msg = "Hello my name is sakuya, im 24 year old and study in UCAS University"
-msg = "今天晚上吃什么?"
-model_path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-baseline_model_path = os.path.expanduser("~/huggingface/baseline/")
-torch.set_default_dtype(torch.bfloat16)
-torch.set_default_device("cuda")
-data_path = model_path
+from utils.config import GlobalConfig
 
 
 def main():
+    cfg = GlobalConfig.from_yaml("configs/default.yaml")
+
+    torch.set_default_dtype(cfg.env.get_torch_dtype())
+    torch.set_default_device(cfg.env.device)
 
     dist.init_process_group(
-        backend="nccl" if torch.cuda.is_available() else "gloo",
-        init_method="tcp://localhost:29500",
-        world_size=1,
-        rank=0,
+        backend=cfg.env.distributed.backend if torch.cuda.is_available() else "gloo",
+        init_method=cfg.env.distributed.init_method,
+        world_size=cfg.env.distributed.world_size,
+        rank=cfg.env.distributed.rank,
     )
 
     logger.info("Loading model...")
+    data_path = cfg.path.data_path or cfg.path.model_path
     loader = ModelLoader(data_path)
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    config = AutoConfig.from_pretrained(model_path)
-
-    model_skeleton = Qwen3ForCausalLM(config).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.path.model_path)
+    config = AutoConfig.from_pretrained(cfg.path.model_path)
+    model_skeleton = Qwen3ForCausalLM(config).to(cfg.env.device)
     model = loader.inject_data(model_skeleton)
-    runner = ModelRunner(
-        model=model,
-        tokenizer=tokenizer,
-        prompt=msg,
-        device=device,
-        max_new_tokens=max_new_tokens,
-        check_correction=True,
-        use_profile=False,
-        use_kvcache=True,
-        sample_method="",
-        temperature=0.8,
-        topk=50,
-        topp=0.95,
-        baseline_model_path=baseline_model_path,
-    )
+
+    runner = ModelRunner(model=model, tokenizer=tokenizer, cfg=cfg)
 
     text = runner.inference()
     logger.info(f"生成结果: \n{text}")

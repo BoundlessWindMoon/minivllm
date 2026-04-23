@@ -24,7 +24,7 @@ from model.qwen3 import (
 )
 
 # Import decoupled utilities
-from utils.config import QuantConfig
+from utils.config import QuantConfig, EnvironmentConfig, CalibConfig
 from utils import model_utils
 from utils import quantize_utils
 from utils import scale_utils
@@ -36,27 +36,27 @@ class Quantizer:
         model,
         tokenizer,
         quant_config: QuantConfig,
-        device="cuda:0",
+        env_config: EnvironmentConfig,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.quant_config = quant_config
-        self.device = device
+        self.env_config = env_config
+
+        self.calib_config = self.quant_config.calibration
+
+        self.device = env_config.device
         self.target_layers = self._get_target_layers()
 
-        # hard code for temporary
-        self.calib_data = 'pileval'
-        self.calib_n_samples = 32
-        self.calib_max_seq_length = 512
-        self.calib_split = 'train'
-        self.calib_text_column = 'text'
-        self._apply_clip = True
-        self.export_compatible = False
-        self.max_chunk_memory = 1024 * 1024 * 1024
-        self.linear_version = 'gemm'
+        # quant_config
+        self._apply_clip = quant_config.apply_clip
+        self.export_compatible = quant_config.export_compatible
+        self.max_chunk_memory = quant_config.max_chunk_memory
+        self.backend = quant_config.backend
 
         self.modules, self.layer_kwargs, self.inps = self._init_quant(
-            nsamples=self.calib_n_samples, max_seq_len=self.calib_max_seq_length
+            nsamples=self.calib_config.n_samples,
+            max_seq_len=self.calib_config.max_seq_length,
         )
 
     def _calibrate(self):
@@ -79,27 +79,20 @@ class Quantizer:
                 raise ValueError("quantization target not supported")
         return tuple(dict.fromkeys(target_layers))
 
-    def _quantize_layer(self, layer):
-        from layers.linear_quantized import QuantizedLinearWrapper
-
-        quantized_layer = QuantizedLinearWrapper(
-            original_layer=layer, group_size=self.quant_config.group_size
-        )
-        return quantized_layer
-
     def _get_model_layers(self, model):
         raise NotImplementedError
 
     def _init_quant(self, nsamples, max_seq_len):
         modules = self.model.model.layers
+        calib_cfg = self.calib_config
 
         samples = get_calib_dataset(
-            data=self.calib_data,
+            data=calib_cfg.data,
             tokenizer=self.tokenizer,
             n_samples=nsamples,
             max_seq_len=max_seq_len,
-            split=self.calib_split,
-            text_column=self.calib_text_column,
+            split=calib_cfg.split,
+            text_column=calib_cfg.text_column,
         )
         samples = torch.cat(samples, dim=0)
         inps = []
@@ -406,13 +399,13 @@ class Quantizer:
                 )
             )
 
-            if self.linear_version == "gemm":
+            if self.backend in ["gemm", "triton"]:
                 scales = scales.t().contiguous()
                 if zeros is not None:
                     zeros = zeros.t().contiguous()
                 q_linear_module = WQLinear_GEMM
             else:
-                raise ValueError(f"Unknown version {self.linear_version}")
+                raise ValueError(f"Unknown backend {self.backend}")
 
             q_linear = q_linear_module.from_linear(
                 linear=linear_layer,
@@ -421,6 +414,7 @@ class Quantizer:
                 init_only=False,
                 scales=scales,
                 zeros=zeros,
+                backend=self.backend,
             )
             model_utils.set_op_by_name(module, name, q_linear)
 

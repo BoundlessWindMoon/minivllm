@@ -14,6 +14,7 @@ except:
     VERIFIER_AVAILABLE = False
     warnings.warn("Verifier is not available, some features may not work.")
 from typing import Optional
+from utils.config import GlobalConfig
 
 
 class ModelRunner:
@@ -21,71 +22,70 @@ class ModelRunner:
         self,
         model,
         tokenizer,
-        max_new_tokens,
-        prompt="",
-        check_correction=False,
-        use_profile=False,
-        use_kvcache=True,
-        use_progress=True,
-        sample_method: Optional[str] = "greedy",
-        temperature: Optional[float] = 1.0,
-        topk: int = 1,
-        topp: float = 1.0,
-        baseline_model_path: Optional[str] = None,
-        baseline_model_dtype: Optional[torch.dtype] = torch.bfloat16,
-        device="cuda:0",
-        profile_dir: str = "./log/profile/",
+        # max_new_tokens,
+        # prompt="",
+        # check_correction=False,
+        # use_profile=False,
+        # use_kvcache=True,
+        # use_progress=True,
+        # sample_method: Optional[str] = "greedy",
+        # temperature: Optional[float] = 1.0,
+        # topk: int = 1,
+        # topp: float = 1.0,
+        # baseline_model_path: Optional[str] = None,
+        # baseline_model_dtype: Optional[torch.dtype] = torch.bfloat16,
+        # device="cuda:0",
+        # profile_dir: str = "./log/profile/",
+        cfg: GlobalConfig,
     ):
         self.model = model
-        self.device = device
-        self.check_correction = check_correction
-        self.use_profile = use_profile
-        self.use_kvcache = use_kvcache
-        self.use_progress = use_progress
         self.tokenizer = tokenizer
-        self.sample_method = sample_method
-        self.temperature = temperature
-        self.topk = topk
-        self.topp = topp
-        self.max_new_tokens = max_new_tokens
-        self.profile_dir = profile_dir
-        self.prompt = prompt
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        self.cfg = cfg
+
+        self.device = cfg.env.device
+        self.max_new_tokens = cfg.inference.max_new_tokens
+        self.check_correction = cfg.inference.check_correction
+        self.use_profile = cfg.inference.use_profile
+        self.use_kvcache = cfg.inference.use_kvcache
+        self.profile_dir = cfg.path.profile_dir
+
+        self.use_progress = True
+
+        self.prompt = cfg.inference.prompt
+        inputs = self.tokenizer(self.prompt, return_tensors="pt").to(self.device)
         self.input_ids = inputs["input_ids"].to(self.device)
         self.position_ids = torch.arange(
             self.input_ids.shape[1], device=self.device
         ).unsqueeze(0)
 
-        self.baseline_model_path = baseline_model_path
-        self.baseline_model_dtype = baseline_model_dtype or torch.bfloat16
+        sampling_cfg = cfg.inference.sampling
+        self.sampler = Sampler(
+            sampling_cfg.sample_method,
+            sampling_cfg.temperature,
+            top_k=sampling_cfg.topk,
+            top_p=sampling_cfg.topp,
+        )
+
+        if sampling_cfg.sample_method != "greedy":
+            self.check_correction = False
+            logger.warning(
+                "Only greedy sampling method supports correction, so correction is disabled."
+            )
 
         self.verifier = None
         self.verification_results = {}
-
-        self.sampler = Sampler(
-            self.sample_method, self.temperature, top_k=self.topk, top_p=self.topp
-        )
-        if sample_method != "greedy":
-            self.check_correction = False
-            logger.warning(
-                f"Only greedy sampling method supports correction, so correction is disabled."
-            )
-        else:
-            logger.error(f"Sample method is not set, please set it")
-
         if self.check_correction:
             if not VERIFIER_AVAILABLE:
                 raise RuntimeError("Verifier is not available.")
-            if self.baseline_model_path is None:
+            if cfg.path.baseline_model_path is None:
                 raise ValueError(
                     "baseline_model_path must be provided for verification"
                 )
-
             self.verifier = Verifier(
-                baseline_model_path=self.baseline_model_path,
-                baseline_model_dtype=self.baseline_model_dtype,
+                baseline_model_path=cfg.path.baseline_model_path,
+                baseline_model_dtype=cfg.env.get_torch_dtype(),
                 tokenizer=tokenizer,
-                device=device,
+                device=self.device,
             )
 
         self.prof = None
@@ -103,10 +103,9 @@ class ModelRunner:
             logger.info(
                 f"[Profiler] Enabled. Trace will be saved to {self.profile_dir}"
             )
-
         if not self.use_kvcache:
             logger.error(
-                f"KVCACHE is not enabled, please enable it for better performance"
+                "KVCACHE is not enabled, please enable it for better performance"
             )
             assert self.use_kvcache == True
 

@@ -2,10 +2,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from kernels.awq_gemm import awq_gemm_forward
+
 
 class WQLinear_GEMM(nn.Module):
     def __init__(
-        self, w_bit, group_size, in_features, out_features, bias, dev, training=False
+        self,
+        w_bit,
+        group_size,
+        in_features,
+        out_features,
+        bias,
+        dev,
+        training=False,
+        backend='gemm',
     ):
         super().__init__()
 
@@ -17,7 +27,7 @@ class WQLinear_GEMM(nn.Module):
         self.w_bit = w_bit
         self.group_size = group_size if group_size != -1 else in_features
         self.training = training
-
+        self.backend = backend
         assert self.in_features % self.group_size == 0
         assert out_features % (32 // self.w_bit) == 0
 
@@ -71,7 +81,14 @@ class WQLinear_GEMM(nn.Module):
 
     @classmethod
     def from_linear(
-        cls, linear, w_bit, group_size, init_only=False, scales=None, zeros=None
+        cls,
+        linear,
+        w_bit,
+        group_size,
+        init_only=False,
+        scales=None,
+        zeros=None,
+        backend='gemm',
     ):
         awq_linear = cls(
             w_bit,
@@ -80,6 +97,7 @@ class WQLinear_GEMM(nn.Module):
             linear.weight.shape[0],
             bias=linear.bias is not None,
             dev=linear.weight.device,
+            backend=backend,
         )
         if init_only:  # just prepare for loading sd
             return awq_linear
@@ -162,21 +180,26 @@ class WQLinear_GEMM(nn.Module):
         return awq_linear
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        pack_num = 32 // self.w_bit
-        shifts = self.shifts
+        if self.backend == 'triton':
+            return awq_gemm_forward(
+                x, self.qweight, self.scales, self.unpack_zeros, self.bias
+            )
+        else:
+            pack_num = 32 // self.w_bit
+            shifts = self.shifts
 
-        intweight = (self.qweight.unsqueeze(-1) >> shifts) & 0xF
+            intweight = (self.qweight.unsqueeze(-1) >> shifts) & 0xF
 
-        intweight = intweight.reshape(
-            self.out_features, self.in_features // self.group_size, self.group_size
-        )
+            intweight = intweight.reshape(
+                self.out_features, self.in_features // self.group_size, self.group_size
+            )
 
-        weight = (
-            intweight.float() - self.unpack_zeros.unsqueeze(-1).float()
-        ) * self.scales.unsqueeze(-1).float()
+            weight = (
+                intweight.float() - self.unpack_zeros.unsqueeze(-1).float()
+            ) * self.scales.unsqueeze(-1).float()
 
-        weight = weight.reshape(self.out_features, self.in_features)
+            weight = weight.reshape(self.out_features, self.in_features)
 
-        weight = weight.to(x.dtype)
-        bias = self.bias.to(x.device).to(x.dtype) if self.bias is not None else None
-        return F.linear(x, weight, bias)
+            weight = weight.to(x.dtype)
+            bias = self.bias.to(x.device).to(x.dtype) if self.bias is not None else None
+            return F.linear(x, weight, bias)
