@@ -5,7 +5,6 @@ import triton.language as tl
 import torch.nn.functional as F
 
 from utils.logger import logger
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from utils.context import get_context
 
 
