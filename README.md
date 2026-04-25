@@ -2,7 +2,7 @@
 
 # ⚡ Mini-vLLM
 
-**A light, transparent, and modular inference & quantization engine for LLMs study.**
+**A light, transparent, and modular inference & quantization engine for studying LLMs.**
 
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.9-EE4C2C.svg)](https://pytorch.org/)
@@ -14,7 +14,7 @@
 
 - **Transparent Architecture**: Cleanly separated modules for Model, Engine, and Kernels.
 - **AWQ Quantization**: Built-in 4-bit AWQ quantization support with calibration.
-- **KV Cache Optimization**: Efficient Key-Value cache management for faster autoregressive decoding.
+- **KV Cache Management**: Simple Key-Value cache management for autoregressive decoding.
 
 
 ---
@@ -99,6 +99,13 @@ mini-vllm/
 ├── main.py                # Entry point for inference
 └── quant.py               # Entry point for quantization
 ```
+## 🗺️ Roadmap
+- [x] **Autoregressive Decoding & KV Cache**: Basic generation loop with Key-Value cache management.
+- [x] **AWQ Quantization & Forward Pass**: 4-bit calibration and quantized linear layer forward implementation.
+- [ ] **Quantized Kernel Support**: Integrate CUDA/Triton kernels for faster 4-bit inference.
+- [ ] **Quantized Model Persistence**: Support saving and loading calibrated AWQ weights.
+- [ ] **EOS Token Adaptation**: Handling of End-of-Sequence tokens.
+
 ## 🙏 Acknowledgements
 
 This project is inspired by and references the following excellent open-source works or utils:

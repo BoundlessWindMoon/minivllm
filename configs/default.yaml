@@ -1,6 +1,6 @@
 env:
   device: "cuda:0"
-  default_dtype: "bfloat16"
+  default_dtype: "float16"
   distributed:
     backend: "nccl"
     init_method: "tcp://localhost:29500"
@@ -35,7 +35,7 @@ quant:
   has_zero_point: true
   apply_clip: true
   export_compatible: false
-  backend: "gemm"
+  backend: "triton"
   max_chunk_memory: 1073741824 
   calibration:
     data: "pileval"
