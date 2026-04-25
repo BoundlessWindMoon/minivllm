@@ -10,9 +10,9 @@ from utils.logger import logger
 from utils.config import GlobalConfig
 from utils.model_loader import ModelLoader
 from utils.quantizer import Quantizer
+from utils.quant_model_io import save_quantized_model
 
 from transformers import AutoTokenizer, AutoConfig
-from engine.model_runner import ModelRunner
 from model.qwen3 import Qwen3ForCausalLM
 
 
@@ -48,10 +48,17 @@ def main():
     logger.info("Starting quantization...")
     model = quantizer.run()
 
-    runner = ModelRunner(model=model, tokenizer=tokenizer, cfg=cfg)
+    if cfg.path.quantized_model_path:
+        save_quantized_model(
+            model,
+            cfg.path.quantized_model_path,
+            cfg.quant,
+            cfg.path.model_path,
+        )
+        logger.info(f"Quantized model saved to {cfg.path.quantized_model_path}")
+    else:
+        logger.warning("quantized_model_path not set, model will not be saved.")
 
-    text = runner.inference()
-    logger.info(f"量化后生成结果: \n{text}")
     dist.destroy_process_group()
 
 

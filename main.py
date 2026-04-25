@@ -1,4 +1,5 @@
 import os
+import json
 import torch
 import torch.distributed as dist
 
@@ -6,6 +7,11 @@ from utils.logger import logger
 from datetime import datetime
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from utils.model_loader import ModelLoader
+from utils.quant_model_io import (
+    is_quantized_model,
+    prepare_model_for_quantized_load,
+    load_quantized_weights,
+)
 from engine.model_runner import ModelRunner
 from model.qwen3 import Qwen3ForCausalLM
 from utils.config import GlobalConfig
@@ -26,11 +32,22 @@ def main():
 
     logger.info("Loading model...")
     data_path = cfg.path.data_path or cfg.path.model_path
-    loader = ModelLoader(data_path)
     tokenizer = AutoTokenizer.from_pretrained(cfg.path.model_path)
-    config = AutoConfig.from_pretrained(cfg.path.model_path)
-    model_skeleton = Qwen3ForCausalLM(config).to(cfg.env.device)
-    model = loader.inject_data(model_skeleton)
+
+    if is_quantized_model(data_path):
+        logger.info("Detected quantized model, loading quantized weights...")
+        config = AutoConfig.from_pretrained(data_path)
+        model_skeleton = Qwen3ForCausalLM(config).to(cfg.env.device)
+        with open(os.path.join(data_path, "quant_config.json")) as f:
+            quant_info = json.load(f)
+        prepare_model_for_quantized_load(model_skeleton, quant_info, cfg.quant.backend)
+        load_quantized_weights(model_skeleton, data_path, quant_info)
+        model = model_skeleton
+    else:
+        loader = ModelLoader(data_path)
+        config = AutoConfig.from_pretrained(cfg.path.model_path)
+        model_skeleton = Qwen3ForCausalLM(config).to(cfg.env.device)
+        model = loader.inject_data(model_skeleton)
 
     runner = ModelRunner(model=model, tokenizer=tokenizer, cfg=cfg)
 

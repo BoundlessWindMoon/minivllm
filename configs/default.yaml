@@ -10,8 +10,9 @@ env:
 path:
   model_path: "~/huggingface/Qwen3-0.6B/"
   baseline_model_path: "~/huggingface/baseline/"
-  data_path: "" 
+  data_path: ""
   profile_dir: "./log/profile/"
+  quantized_model_path: "~/huggingface/Qwen3-0.6B-AWQ/"
 
 inference:
   prompt: "Hello, I am sakuya, I'm a 24 year old student from UCAS University. I like LLM and Infra"

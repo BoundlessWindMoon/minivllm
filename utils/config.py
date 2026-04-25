@@ -40,6 +40,7 @@ class PathConfig:
     baseline_model_path: str = "~/huggingface/baseline/"
     data_path: str = ""
     profile_dir: str = "./log/profile/"
+    quantized_model_path: str = ""
 
     def __post_init__(self):
         if self.model_path:
@@ -50,6 +51,8 @@ class PathConfig:
             self.data_path = os.path.expanduser(self.data_path)
         if self.profile_dir:
             self.profile_dir = os.path.expanduser(self.profile_dir)
+        if self.quantized_model_path:
+            self.quantized_model_path = os.path.expanduser(self.quantized_model_path)
 
 
 @dataclass
