@@ -36,7 +36,7 @@ quant:
   has_zero_point: true
   apply_clip: true
   export_compatible: false
-  backend: "triton"
+  backend: "triton" # gemm or triton
   max_chunk_memory: 1073741824 
   calibration:
     data: "pileval"

@@ -412,9 +412,6 @@ class Quantizer:
             )
 
             if self.backend in ["gemm", "triton"]:
-                scales = scales.t().contiguous()
-                if zeros is not None:
-                    zeros = zeros.t().contiguous()
                 q_linear_module = WQLinear_GEMM
             else:
                 raise ValueError(f"Unknown backend {self.backend}")

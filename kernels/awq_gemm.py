@@ -83,9 +83,6 @@ def _awq_gemm_kernel(
 
 
 def awq_gemm_forward(x, qweight, scales, zeros, group_size, num_pack, bias=None):
-    qweight = qweight.contiguous()
-    scales = scales.contiguous()
-    zeros = zeros.contiguous()
 
     original_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])

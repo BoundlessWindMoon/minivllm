@@ -104,9 +104,6 @@ class WQLinear_GEMM(nn.Module):
 
         # need scales and zeros info for real quantization
         assert scales is not None and zeros is not None
-        scales = scales.t().clone().half()
-        zeros = zeros.t().clone()
-
         scale_zeros = zeros * scales
 
         awq_linear.scales = scales.clone().half()
