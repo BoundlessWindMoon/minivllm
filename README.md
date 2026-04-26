@@ -58,9 +58,15 @@ python main.py
 ```
 
 ### 4. Run Quantization (AWQ)
-Run the quantization pipeline and test the quantized model:
+Run the quantization pipeline and save it!:
 ```bash
 python quant.py
+```
+
+### 5. Run Quantization Inference(AWQ)
+Test the quantized model:
+```bash
+python run_quantized.py
 ```
 
 ## ⚙️ Configuration
@@ -105,8 +111,8 @@ mini-vllm/
 - [x] **AWQ Quantization & Forward Pass**: 4-bit calibration and quantized linear layer forward implementation.
 - [x] **Quantized Kernel Support**: Integrate CUDA/Triton kernels for 4-bit model inference.
 - [x] **Quantized Model Persistence**: Support saving and loading calibrated AWQ weights.
-- [ ] **Implement EOS Stopping Criteria**: Ensure generation loops break correctly on EOS tokens.
-- [ ] **Optimize Quantized Compute Path**: Refactor Triton kernels for better performance.
+- [ ] **Implement EOS**: Ensure generation loops break correctly on EOS tokens.
+- [ ] **Optimize Quantized Kernel**: Refactor Triton kernels for better performance.
 - [ ] **Integrate Automated Profiler**: Embed profiling utils to diagnose performance bottlenecks automatically.
 
 ## 🙏 Acknowledgements
