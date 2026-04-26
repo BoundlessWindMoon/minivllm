@@ -97,14 +97,17 @@ mini-vllm/
 ├── model/                 # Model architectures (e.g., Qwen3)
 ├── utils/                 # Config, Logger, Loader, Quantizer
 ├── main.py                # Entry point for inference
-└── quant.py               # Entry point for quantization
+└── quant.py               # Entry point for quantization model
+└── run_quantized.py       # Entry point for inference with quantized model
 ```
 ## 🗺️ Roadmap
 - [x] **Autoregressive Decoding & KV Cache**: Basic generation loop with Key-Value cache management.
 - [x] **AWQ Quantization & Forward Pass**: 4-bit calibration and quantized linear layer forward implementation.
-- [ ] **Quantized Kernel Support**: Integrate CUDA/Triton kernels for faster 4-bit inference.
-- [ ] **Quantized Model Persistence**: Support saving and loading calibrated AWQ weights.
-- [ ] **EOS Token Adaptation**: Handling of End-of-Sequence tokens.
+- [x] **Quantized Kernel Support**: Integrate CUDA/Triton kernels for 4-bit model inference.
+- [x] **Quantized Model Persistence**: Support saving and loading calibrated AWQ weights.
+- [ ] **Implement EOS Stopping Criteria**: Ensure generation loops break correctly on EOS tokens.
+- [ ] **Optimize Quantized Compute Path**: Refactor Triton kernels for better performance.
+- [ ] **Integrate Automated Profiler**: Embed profiling utils to diagnose performance bottlenecks automatically.
 
 ## 🙏 Acknowledgements
 
