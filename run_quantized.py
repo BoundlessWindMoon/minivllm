@@ -1,5 +1,6 @@
 import os
 import json
+import argparse
 import torch
 import torch.distributed as dist
 
@@ -16,7 +17,10 @@ from utils.config import GlobalConfig
 
 
 def main():
-    cfg = GlobalConfig.from_yaml("configs/default.yaml")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/default.yaml")
+    args = parser.parse_args()
+    cfg = GlobalConfig.from_yaml(args.config)
 
     torch.set_default_dtype(cfg.env.get_torch_dtype())
     torch.set_default_device(cfg.env.device)

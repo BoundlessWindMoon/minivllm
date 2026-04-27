@@ -1,0 +1,46 @@
+env:
+  device: "cuda:0"
+  default_dtype: "float16"
+  distributed:
+    backend: "nccl"
+    init_method: "tcp://localhost:29500"
+    world_size: 1
+    rank: 0
+
+path:
+  model_path: "~/huggingface/Qwen3-0.6B/"
+  baseline_model_path: "~/huggingface/baseline/"
+  data_path: ""
+  profile_dir: "./log/profile/"
+  quantized_model_path: "~/huggingface/Qwen3-0.6B-AWQ/"
+
+inference:
+  prompt: "Hello"
+  max_new_tokens: 2
+  use_kvcache: true
+  check_correction: false
+  use_profile: false
+  sampling:
+    sample_method: "greedy"
+    temperature: 1.0
+    topk: 1
+    topp: 1.0
+
+quant:
+  quant_method: "AWQ"
+  quant_bits: 4
+  quant_targets:
+    - "MLP"
+    - "ATTENTION"
+  group_size: 128
+  has_zero_point: true
+  apply_clip: true
+  export_compatible: false
+  backend: "triton"
+  max_chunk_memory: 1073741824
+  calibration:
+    data: "pileval"
+    n_samples: 32
+    max_seq_length: 512
+    split: "train"
+    text_column: "text"
