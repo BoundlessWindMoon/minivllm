@@ -35,10 +35,10 @@ NCU_REPORT="$OUTPUT_DIR/profile.ncu-rep"
 NCU_CSV="$OUTPUT_DIR/profile.csv"
 
 if $FULL_MODE; then
-    METRIC_ARG="all"
+    NCU_PROFILE_FLAGS="--set full"
     echo "==> FULL MODE: Collecting ALL metrics (this will be slow)..."
 else
-    METRIC_ARG=""
+    NCU_PROFILE_FLAGS=""
     echo "==> STANDARD MODE: Collecting raw page metrics..."
 fi
 
@@ -50,11 +50,6 @@ echo ""
 # Prevent huggingface tokenizers from complaining about fork
 export TOKENIZERS_PARALLELISM=false
 
-NCU_METRICS_FLAG=""
-if [[ -n "$METRIC_ARG" ]]; then
-    NCU_METRICS_FLAG="--metrics $METRIC_ARG"
-fi
-
 # Run profiling
 # --launch-count 2: only sample the first 2 matching kernel invocations.
 #   Combined with configs/profile.yaml (max_new_tokens=2), this caps NCU
@@ -63,8 +58,8 @@ fi
 set +e
 ncu \
     --kernel-name "_awq_gemm_kernel" \
-    --launch-count 2 \
-    $NCU_METRICS_FLAG \
+    --launch-count 10 \
+    $NCU_PROFILE_FLAGS \
     --export "$NCU_REPORT" \
     --csv \
     --page raw \

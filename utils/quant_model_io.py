@@ -6,13 +6,16 @@ from safetensors.torch import save_file, load_file
 from typing import List
 
 from layers.quanted_linear import WQLinear_GEMM
+from layers.quanted_linear_cached import WQLinear_GEMM_Cached
 from utils.model_utils import set_op_by_name
 from utils.scale_utils import ScaledActivation
 from utils.logger import logger
 
 
 def _get_quantized_layer_names(model) -> List[str]:
-    return [name for name, m in model.named_modules() if isinstance(m, WQLinear_GEMM)]
+    return [
+        name for name, m in model.named_modules() if isinstance(m, WQLinear_GEMM_Cached)
+    ]
 
 
 def _get_scaled_activation_info(model) -> dict:
@@ -64,7 +67,7 @@ def _replace_layer_with_quantized(
     model, layer_name: str, quant_bits: int, group_size: int, backend: str
 ):
     linear_layer = model.get_submodule(layer_name)
-    q_linear = WQLinear_GEMM.from_linear(
+    q_linear = WQLinear_GEMM_Cached.from_linear(
         linear=linear_layer,
         w_bit=quant_bits,
         group_size=group_size,

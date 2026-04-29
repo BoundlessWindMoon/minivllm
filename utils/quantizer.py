@@ -29,6 +29,7 @@ from layers.linear import (
     LinearBase,
 )
 from layers.quanted_linear import WQLinear_GEMM
+from layers.quanted_linear_cached import WQLinear_GEMM_Cached
 from model.qwen3 import (
     Qwen3DecoderLayer,
     Qwen3Attention,
@@ -412,7 +413,7 @@ class Quantizer:
             )
 
             if self.backend in ["gemm", "triton"]:
-                q_linear_module = WQLinear_GEMM
+                q_linear_module = WQLinear_GEMM_Cached
             else:
                 raise ValueError(f"Unknown backend {self.backend}")
 

@@ -12,7 +12,7 @@ path:
   baseline_model_path: "~/huggingface/baseline/"
   data_path: ""
   profile_dir: "./log/profile/"
-  quantized_model_path: "~/huggingface/Qwen3-0.6B-AWQ/"
+  quantized_model_path: "~/huggingface/Qwen3-0.6B-AWQ_Cached/"
 
 inference:
   prompt: "Hello, I am sakuya, I'm a 24 year old student from UCAS University. I like LLM and Infra"
@@ -36,7 +36,7 @@ quant:
   has_zero_point: true
   apply_clip: true
   export_compatible: false
-  backend: "triton" # gemm or triton
+  backend: "gemm" # gemm / triton_naive / triton_splitk / triton_unroll
   max_chunk_memory: 1073741824 
   calibration:
     data: "pileval"

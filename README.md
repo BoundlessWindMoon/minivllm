@@ -69,6 +69,11 @@ Test the quantized model:
 python run_quantized.py
 ```
 
+### (Optional). Run Profile for Int4 Inference
+```bash
+bash ./scripts/run_ncu_profile.sh --full
+```
+
 ## ⚙️ Configuration
 You can easily control all behaviors by editing `configs/default.yaml`.
 

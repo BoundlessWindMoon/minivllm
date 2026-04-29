@@ -177,7 +177,7 @@ class WQLinear_GEMM(nn.Module):
         return awq_linear
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.backend == 'triton':
+        if 'triton' in self.backend:
             return awq_gemm_forward(
                 x,
                 self.qweight,
@@ -186,6 +186,7 @@ class WQLinear_GEMM(nn.Module):
                 self.group_size,
                 32 // self.w_bit,
                 self.bias,
+                self.backend,
             )
         else:
             pack_num = 32 // self.w_bit

@@ -43,10 +43,43 @@ def _is_time_metric(name: str) -> bool:
 def _is_percentage_metric(name: str) -> bool:
     """Heuristically detect percentage metrics."""
     lower = name.lower()
+    # derived__pct_occupancy_per_* are ratios (slope), not percentages.
+    if "derived__pct_occupancy" in lower:
+        return False
     # Split by common delimiters and check for exact token 'pct' to avoid
     # false positives (e.g. 'duration' does NOT contain 'pct' as a token).
     tokens = re.split(r"[._\s]", lower)
     return "pct" in tokens or "percent" in lower
+
+
+def _aggregate_metric(name: str, values: list[float]) -> float:
+    """Aggregate metric values across multiple kernel invocations.
+
+    NCU suffix semantics:
+      .avg -> average across invocations
+      .max -> max across invocations
+      .min -> min across invocations
+      .sum -> sum across invocations
+      (no suffix) -> if constant (launch config), keep it; else sum
+    """
+    if not values:
+        return 0.0
+    if name.endswith(".avg"):
+        return sum(values) / len(values)
+    elif name.endswith(".max"):
+        return max(values)
+    elif name.endswith(".min"):
+        return min(values)
+    elif name.endswith(".sum"):
+        return sum(values)
+    else:
+        # No suffix: launch config metrics should be averaged if they vary;
+        # counters like sm__cycles_active should be summed.
+        if len(set(values)) == 1:
+            return values[0]
+        if name.lower().startswith("launch__"):
+            return sum(values) / len(values)
+        return sum(values)
 
 
 def _find_col(cols: list[str], candidates: list[str]) -> str | None:
@@ -79,17 +112,21 @@ def parse_long_format(rows: list[dict]) -> dict[str, dict[str, float]]:
         print(f"Columns found: {cols}", file=sys.stderr)
         sys.exit(1)
 
-    kernels: dict[str, dict[str, float]] = defaultdict(dict)
+    raw: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     for row in rows:
         kname = row.get(kernel_col, "Unknown").strip()
+        if not kname:
+            continue
         mname = row.get(metric_col, "").strip()
+        if not mname or mname.lower().startswith("device__attribute_"):
+            continue
         mval = _to_float(row.get(value_col, ""))
-        if mname:
-            # For long format, same kernel may appear multiple times (one per metric).
-            # If a metric appears multiple times for the same kernel, sum them.
-            kernels[kname][mname] = kernels[kname].get(mname, 0.0) + mval
+        raw[kname][mname].append(mval)
 
-    return dict(kernels)
+    kernels: dict[str, dict[str, float]] = {}
+    for kname, metrics in raw.items():
+        kernels[kname] = {mname: _aggregate_metric(mname, vals) for mname, vals in metrics.items()}
+    return kernels
 
 
 def _discover_metric_columns(cols: list[str]) -> list[str]:
@@ -111,6 +148,7 @@ def _discover_metric_columns(cols: list[str]) -> list[str]:
         r"^grid\s*size$",
         r"^device$",
         r"^ invocation",
+        r"^device__attribute_",
     ]
     metrics = []
     for c in cols:
@@ -139,16 +177,22 @@ def parse_wide_format(rows: list[dict]) -> dict[str, dict[str, float]]:
         print("Warning: No metric columns discovered in wide-format CSV.", file=sys.stderr)
         print(f"Columns found: {cols}", file=sys.stderr)
 
-    kernels: dict[str, dict[str, float]] = defaultdict(dict)
+    raw: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     for row in rows:
         kname = row.get(kernel_col, "Unknown").strip()
+        if not kname:
+            continue
         for mcol in metric_cols:
             mname = mcol.strip()
+            if mname.lower().startswith("device__attribute_"):
+                continue
             mval = _to_float(row.get(mcol, ""))
-            # Sum if same kernel-metric pair appears multiple times
-            kernels[kname][mname] = kernels[kname].get(mname, 0.0) + mval
+            raw[kname][mname].append(mval)
 
-    return dict(kernels)
+    kernels: dict[str, dict[str, float]] = {}
+    for kname, metrics in raw.items():
+        kernels[kname] = {mname: _aggregate_metric(mname, vals) for mname, vals in metrics.items()}
+    return kernels
 
 
 def parse_ncu_csv(path: str) -> dict[str, dict[str, float]]:
@@ -176,11 +220,18 @@ def compute_derived(kernels: dict[str, dict[str, float]]) -> dict[str, dict[str,
 
         for mname, mval in metrics.items():
             lower = mname.lower()
-            if "dram__bytes_read" in lower or "bytes_read" in lower:
+            # Prefer .sum variants for total bandwidth computation
+            if "dram__bytes_read.sum" in lower:
                 read_b = mval
-            if "dram__bytes_write" in lower or "bytes_write" in lower:
+            elif "dram__bytes_read" in lower and read_b == 0.0:
+                read_b = mval
+            if "dram__bytes_write.sum" in lower:
                 write_b = mval
-            if "gpu__time_duration" in lower or ("time" in lower and "duration" in lower):
+            elif "dram__bytes_write" in lower and write_b == 0.0:
+                write_b = mval
+            if "gpu__time_duration.sum" in lower:
+                time_ns = mval
+            elif "gpu__time_duration" in lower and time_ns == 0.0:
                 time_ns = mval
 
         metrics["__total_dram_mb"] = (read_b + write_b) / (1024 * 1024)
