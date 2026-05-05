@@ -1,46 +1,52 @@
 env:
-  device: "cuda:0"
-  default_dtype: "float16"
+  default_dtype: float16
+  device: cuda:0
   distributed:
-    backend: "nccl"
-    init_method: "tcp://localhost:29500"
-    world_size: 1
+    backend: nccl
+    init_method: tcp://localhost:29500
     rank: 0
-
-path:
-  model_path: "~/huggingface/Qwen3-0.6B/"
-  baseline_model_path: "~/huggingface/baseline/"
-  data_path: ""
-  profile_dir: "./log/profile/"
-  quantized_model_path: "~/huggingface/Qwen3-0.6B-AWQ_Cached/"
+    world_size: 1
 
 inference:
-  prompt: "Hello, I am sakuya, I'm a 24 year old student from UCAS University. I like LLM and Infra"
-  max_new_tokens: 128
-  use_kvcache: true
   check_correction: false
-  use_profile: false
+  max_new_tokens: 256
+  prompt: Hello, I am sakuya, I'm a 24 year old student from UCAS University. I like
+    LLM and Infra
   sampling:
-    sample_method: "greedy"
+    sample_method: greedy
     temperature: 1.0
     topk: 1
     topp: 1.0
+  use_cuda_graph: true
+  use_kvcache: true
+  use_profile: true
+  use_sdpa: true
 
+path:
+  baseline_model_path: ~/huggingface/baseline/
+  data_path: ''
+  model_path: ~/huggingface/Qwen3-0.6B/
+  profile_dir: ./log/profile/
+  quantized_model_path: ~/huggingface/Qwen3-0.6B-AWQ_Cached     # '' or quantized_model_path
+  
 quant:
-  quant_method: "AWQ"
-  quant_bits: 4
-  quant_targets:
-    - "MLP"
-    - "ATTENTION"
+  apply_clip: true
+  backend: triton_wt_fused
+  calibration:
+    data: pileval
+    max_seq_length: 512
+    n_samples: 32
+    split: train
+    text_column: text
+  export_compatible: false
   group_size: 128
   has_zero_point: true
-  apply_clip: true
-  export_compatible: false
-  backend: "gemm" # gemm / triton_naive / triton_splitk / triton_unroll
-  max_chunk_memory: 1073741824 
-  calibration:
-    data: "pileval"
-    n_samples: 32
-    max_seq_length: 512
-    split: "train"
-    text_column: "text"
+  layout: Wt
+  max_chunk_memory: 1073741824
+  pack_order: sequential
+  quant_bits: 4
+  quant_method: AWQ
+  quant_targets:
+  - MLP
+  - ATTENTION
+  - LM_HEAD

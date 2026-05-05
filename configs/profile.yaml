@@ -12,12 +12,14 @@ path:
   baseline_model_path: "~/huggingface/baseline/"
   data_path: ""
   profile_dir: "./log/profile/"
-  quantized_model_path: "~/huggingface/Qwen3-0.6B-AWQ/"
+  quantized_model_path: "~/huggingface/Qwen3-0.6B-AWQ_Cached/"
 
 inference:
   prompt: "Hello"
   max_new_tokens: 2
   use_kvcache: true
+  use_sdpa: true
+  use_cuda_graph: true
   check_correction: false
   use_profile: false
   sampling:
@@ -36,7 +38,7 @@ quant:
   has_zero_point: true
   apply_clip: true
   export_compatible: false
-  backend: "triton"
+  backend: "triton"              # gemm / triton_naive / triton_splitk / triton_unroll / triton_wt_fused
   max_chunk_memory: 1073741824
   calibration:
     data: "pileval"

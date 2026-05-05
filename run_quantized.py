@@ -34,7 +34,9 @@ def main():
 
     quant_path = cfg.path.quantized_model_path or cfg.path.data_path
     if not quant_path:
-        raise ValueError("quantized_model_path or data_path must be set for quantized inference")
+        raise ValueError(
+            "quantized_model_path or data_path must be set for quantized inference"
+        )
 
     if not is_quantized_model(quant_path):
         raise ValueError(f"No quantized model found at {quant_path}")
@@ -43,15 +45,17 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.path.model_path)
     config = AutoConfig.from_pretrained(quant_path)
+    config.use_sdpa = cfg.inference.use_sdpa
     model_skeleton = Qwen3ForCausalLM(config).to(cfg.env.device)
 
     with open(os.path.join(quant_path, "quant_config.json")) as f:
         quant_info = json.load(f)
 
     prepare_model_for_quantized_load(model_skeleton, quant_info, cfg.quant.backend)
-    load_quantized_weights(model_skeleton, quant_path, quant_info)
+    load_quantized_weights(
+        model_skeleton, quant_path, quant_info, expected_config=cfg.quant
+    )
     model = model_skeleton
-
     runner = ModelRunner(model=model, tokenizer=tokenizer, cfg=cfg)
 
     text = runner.inference()

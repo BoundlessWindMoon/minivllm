@@ -3,7 +3,7 @@ import torch.nn as nn
 
 from layers.linear import LinearBase
 from utils.config import allowed_norms, allowed_act_fns
-from utils.model_utils import get_op_by_name, set_op_by_name
+from utils.model_utils import get_op_by_name
 
 
 class ScaledActivation(nn.Module):
@@ -12,6 +12,7 @@ class ScaledActivation(nn.Module):
         self.act = module
         self.scales = nn.Parameter(scales.data)
 
+    @torch.compile
     def forward(self, x):
         return self.act(x) / self.scales.view(1, 1, -1).to(x.device)
 
@@ -115,8 +116,7 @@ def apply_scale(module, scales_list, input_feat_dict=None):
             scale_ln_fcs(prev_op, layers, scales)
 
         elif any(isinstance(prev_op, t) for t in allowed_act_fns):
-            new_module = ScaledActivation(prev_op, scales)
-            set_op_by_name(module, prev_op_name, new_module)
+            prev_op.scales = nn.Parameter(scales.data)
             scale_gelu_fc(prev_op, layers[0], scales)
 
         else:

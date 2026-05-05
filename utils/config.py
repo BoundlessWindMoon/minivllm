@@ -70,6 +70,8 @@ class InferenceConfig:
     )
     max_new_tokens: int = 128
     use_kvcache: bool = True
+    use_sdpa: bool = True
+    use_cuda_graph: bool = True
     check_correction: bool = False
     use_profile: bool = False
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
@@ -94,6 +96,8 @@ class QuantConfig:
     apply_clip: bool = True
     export_compatible: bool = False
     backend: str = "gemm"
+    layout: str = "Wt"
+    pack_order: str = "sequential"
     max_chunk_memory: int = 1024 * 1024 * 1024
     calibration: CalibConfig = field(default_factory=CalibConfig)
 

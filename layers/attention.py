@@ -60,6 +60,7 @@ class Attention(nn.Module):
         num_kv_heads,
         max_position,
         max_seq_len: int = 4096,
+        use_sdpa: bool = True,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -68,6 +69,7 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.max_seq_len = max_seq_len
         self.max_position = max_position
+        self.use_sdpa = use_sdpa
         self.batch_size = 1
         self.register_buffer(
             "k_cache",
@@ -130,21 +132,35 @@ class Attention(nn.Module):
             v_for_attn = self.v_cache[:, :, : cache_len + seq_len, :]
 
         n_rep = self.num_heads // self.num_kv_heads
-        if n_rep > 1:
-            k_for_attn = k_for_attn.repeat_interleave(n_rep, dim=1)
-            v_for_attn = v_for_attn.repeat_interleave(n_rep, dim=1)
+        if self.use_sdpa:
+            if n_rep > 1:
+                k_for_attn = k_for_attn.repeat_interleave(n_rep, dim=1)
+                v_for_attn = v_for_attn.repeat_interleave(n_rep, dim=1)
+            if is_prefill:
+                o = F.scaled_dot_product_attention(
+                    q, k_for_attn, v_for_attn, is_causal=True
+                )
+            else:
+                o = F.scaled_dot_product_attention(
+                    q, k_for_attn, v_for_attn, is_causal=False
+                )
+        else:
+            n_rep = self.num_heads // self.num_kv_heads
+            if n_rep > 1:
+                k_for_attn = k_for_attn.repeat_interleave(n_rep, dim=1)
+                v_for_attn = v_for_attn.repeat_interleave(n_rep, dim=1)
 
-        attn_weights = torch.matmul(q, k_for_attn.transpose(-2, -1)) * self.scale
+            attn_weights = torch.matmul(q, k_for_attn.transpose(-2, -1)) * self.scale
 
-        seq_len_q = q.shape[2]
-        seq_len_k = k_for_attn.shape[2]
-        causal_mask = torch.triu(
-            torch.ones(seq_len_q, seq_len_k, device=q.device, dtype=torch.bool),
-            diagonal=seq_len_k - seq_len_q + 1,
-        )
-        attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
-        attn_weights = torch.softmax(attn_weights, dim=-1)
-        o = torch.matmul(attn_weights, v_for_attn)
+            seq_len_q = q.shape[2]
+            seq_len_k = k_for_attn.shape[2]
+            causal_mask = torch.triu(
+                torch.ones(seq_len_q, seq_len_k, device=q.device, dtype=torch.bool),
+                diagonal=seq_len_k - seq_len_q + 1,
+            )
+            attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            o = torch.matmul(attn_weights, v_for_attn)
 
         o = o.transpose(1, 2)
         return o

@@ -36,6 +36,7 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
+        use_sdpa: bool = True,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -76,6 +77,7 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
             max_position=max_position,
+            use_sdpa=use_sdpa,
         )
         if not self.qkv_bias:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -91,7 +93,6 @@ class Qwen3Attention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # 显式转换为 4D: (batch, seq_len, num_heads, head_dim)
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
@@ -101,7 +102,7 @@ class Qwen3Attention(nn.Module):
             k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v, use_cache=use_cache)
-        # 修改 flatten 维度，输出形状保持 (batch, seq_len, hidden_size)
+
         output = self.o_proj(o.flatten(2, -1))
         return output
 
@@ -152,6 +153,7 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            use_sdpa=getattr(config, 'use_sdpa', True),
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,

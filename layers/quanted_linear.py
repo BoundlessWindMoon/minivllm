@@ -5,7 +5,11 @@ import torch.nn.functional as F
 from kernels.awq_gemm import awq_gemm_forward
 
 
-class WQLinear_GEMM(nn.Module):
+class WQLinear_W(nn.Module):
+    """Quantized linear with weight in original W layout (out, in).
+    Kernel computes X @ W^T with on-the-fly transpose.
+    """
+
     def __init__(
         self,
         w_bit,
@@ -16,6 +20,8 @@ class WQLinear_GEMM(nn.Module):
         dev,
         training=False,
         backend='gemm',
+        layout='W',
+        pack_order='sequential',
     ):
         super().__init__()
 
@@ -28,6 +34,9 @@ class WQLinear_GEMM(nn.Module):
         self.group_size = group_size if group_size != -1 else in_features
         self.training = training
         self.backend = backend
+        self.layout = layout
+        self.pack_order = pack_order
+        assert self.layout == 'W', f"WQLinear_W expects layout='W', got {self.layout}"
         assert self.in_features % self.group_size == 0
         assert out_features % (32 // self.w_bit) == 0
 
@@ -89,25 +98,28 @@ class WQLinear_GEMM(nn.Module):
         scales=None,
         zeros=None,
         backend='gemm',
+        layout='W',
+        pack_order='sequential',
     ):
         awq_linear = cls(
             w_bit,
             group_size,
             linear.weight.shape[1],
             linear.weight.shape[0],
-            bias=linear.bias is not None,
+            bias=getattr(linear, 'bias', None) is not None,
             dev=linear.weight.device,
             backend=backend,
+            layout=layout,
+            pack_order=pack_order,
         )
-        if init_only:  # just prepare for loading sd
+        if init_only:
             return awq_linear
 
-        # need scales and zeros info for real quantization
         assert scales is not None and zeros is not None
         scale_zeros = zeros * scales
 
         awq_linear.scales = scales.clone().half()
-        if linear.bias is not None:
+        if getattr(linear, 'bias', None) is not None:
             awq_linear.bias = linear.bias.clone().half()
 
         pack_num = 32 // awq_linear.w_bit
@@ -140,11 +152,15 @@ class WQLinear_GEMM(nn.Module):
             device=intweight.device,
         )
 
+        if awq_linear.pack_order == "sequential":
+            order_map = [0, 1, 2, 3, 4, 5, 6, 7]
+        elif awq_linear.pack_order == "swizzled":
+            # order_map = [0, 4, 1, 5, 2, 6, 3, 7]
+            raise NotImplementedError("swizzled pack_order is not implemented")
+        else:
+            raise ValueError(f"Unknown pack_order: {awq_linear.pack_order}")
+
         for col in range(intweight.shape[1] // pack_num):
-            if awq_linear.w_bit == 4:
-                order_map = [0, 1, 2, 3, 4, 5, 6, 7]
-            else:
-                raise NotImplementedError("Only 4-bit are supported for now.")
             for i in range(pack_num):
                 qweight_col = intweight[:, col * pack_num + order_map[i]]
                 qweight[:, col] |= qweight_col << (i * awq_linear.w_bit)
@@ -161,10 +177,6 @@ class WQLinear_GEMM(nn.Module):
 
         zeros_int = zeros.to(torch.int32)
         for col in range(zeros_int.shape[1] // pack_num):
-            if awq_linear.w_bit == 4:
-                order_map = [0, 1, 2, 3, 4, 5, 6, 7]
-            else:
-                raise NotImplementedError("Only 4-bit are supported for now.")
             for i in range(pack_num):
                 qzero_col = zeros_int[:, col * pack_num + order_map[i]]
                 qzeros[:, col] |= qzero_col << (i * awq_linear.w_bit)
@@ -207,3 +219,7 @@ class WQLinear_GEMM(nn.Module):
             weight = weight.to(x.dtype)
             bias = self.bias.to(x.device).to(x.dtype) if self.bias is not None else None
             return F.linear(x, weight, bias)
+
+
+# Backward-compatible alias
+WQLinear_GEMM = WQLinear_W

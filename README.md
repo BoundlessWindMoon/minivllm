@@ -15,6 +15,9 @@
 - **Transparent Architecture**: Cleanly separated modules for Model, Engine, and Kernels.
 - **AWQ Quantization**: Built-in 4-bit AWQ quantization support with calibration.
 - **KV Cache Management**: Simple Key-Value cache management for autoregressive decoding.
+- **W^T Layout & Fused Kernels**: Triton kernels with pre-transposed weight layout and fused dequantization for lower memory traffic.
+- **CUDA Graph Acceleration**: Pre-captured CUDA Graphs for the decode phase to eliminate CPU launch overhead.
+- **Profiler Trace Analysis**: Built-in script to parse PyTorch profiler traces and diagnose kernel-level bottlenecks.
 
 
 ---
@@ -116,9 +119,10 @@ mini-vllm/
 - [x] **AWQ Quantization & Forward Pass**: 4-bit calibration and quantized linear layer forward implementation.
 - [x] **Quantized Kernel Support**: Integrate CUDA/Triton kernels for 4-bit model inference.
 - [x] **Quantized Model Persistence**: Support saving and loading calibrated AWQ weights.
+- [x] **W^T Layout & Fused Triton Kernels**: Pre-transposed weight layout with fused kernels.
+- [x] **CUDA Graph Decode Acceleration**: Pre-capture decode graphs to remove CPU launch overhead.
+- [x] **Profiler Trace Analyzer**: Parse PyTorch profiler JSON and report kernel time breakdown.
 - [ ] **Implement EOS**: Ensure generation loops break correctly on EOS tokens.
-- [ ] **Optimize Quantized Kernel**: Refactor Triton kernels for better performance.
-- [ ] **Integrate Automated Profiler**: Embed profiling utils to diagnose performance bottlenecks automatically.
 
 ## 🙏 Acknowledgements
 

@@ -28,8 +28,9 @@ from layers.linear import (
     RowParallelLinear,
     LinearBase,
 )
-from layers.quanted_linear import WQLinear_GEMM
-from layers.quanted_linear_cached import WQLinear_GEMM_Cached
+from layers.embed_head import ParallelLMHead
+from layers.quanted_linear import WQLinear_W
+from layers.quanted_linear_wt import WQLinear_Wt
 from model.qwen3 import (
     Qwen3DecoderLayer,
     Qwen3Attention,
@@ -83,10 +84,11 @@ class Quantizer:
             if target == "MLP":
                 target_layers.append(MergedColumnParallelLinear)
                 target_layers.append(RowParallelLinear)
-                pass
             elif target == "ATTENTION":
                 target_layers.append(QKVParallelLinear)
                 target_layers.append(RowParallelLinear)
+            elif target == "LM_HEAD":
+                target_layers.append(ParallelLMHead)
             else:
                 logger.error(f"Unknown quantization target: {target}")
                 raise ValueError("quantization target not supported")
@@ -412,10 +414,15 @@ class Quantizer:
                 )
             )
 
-            if self.backend in ["gemm", "triton"]:
-                q_linear_module = WQLinear_GEMM_Cached
+            layout = getattr(self.quant_config, 'layout', 'Wt')
+            pack_order = getattr(self.quant_config, 'pack_order', 'sequential')
+
+            if layout == 'W':
+                q_linear_module = WQLinear_W
+            elif layout == 'Wt':
+                q_linear_module = WQLinear_Wt
             else:
-                raise ValueError(f"Unknown backend {self.backend}")
+                raise ValueError(f"Unknown layout: {layout}")
 
             q_linear = q_linear_module.from_linear(
                 linear=linear_layer,
@@ -425,6 +432,8 @@ class Quantizer:
                 scales=scales,
                 zeros=zeros,
                 backend=self.backend,
+                layout=layout,
+                pack_order=pack_order,
             )
             model_utils.set_op_by_name(module, name, q_linear)
 
@@ -483,7 +492,84 @@ class Quantizer:
 
                 progress.update(quant_task, advance=1)
 
+    @torch.no_grad()
+    def _quantize_lm_head(self):
+        """Quantize lm_head with the same AWQ pipeline as MLP/Attention layers."""
+        lm_head = self.model.lm_head
+        if not isinstance(lm_head, ParallelLMHead):
+            logger.warning("lm_head is not ParallelLMHead, skipping")
+            return
+
+        # Get input features after final norm
+        hidden_states, _ = self.model.model.norm(
+            self.inps, self.layer_kwargs.get("residual")
+        )
+
+        # [STEP 1]: Search best scale (same pipeline as MLP/Attention)
+        scale_info = self._search_best_scale(
+            module=self.model,
+            prev_op=self.model.model.norm,
+            layers=[lm_head],
+            inp=hidden_states,
+            module2inspect=lm_head,
+        )
+
+        # Apply scale to both final norm and lm_head (preserves math equivalence)
+        scale_utils.apply_scale(self.model, [scale_info])
+
+        # [STEP 2]: Search and apply clip
+        if self._apply_clip:
+            max_val = quantize_utils.compute_best_clip(
+                lm_head.weight,
+                hidden_states,
+                self.quant_config.quant_bits,
+                self.quant_config.group_size,
+                self.quant_config.has_zero_point,
+            )
+            quantize_utils.apply_clip(
+                self.model, [("lm_head", max_val)], model_utils.get_op_by_name
+            )
+
+        # [STEP 3]: Quantize weights
+        qweight, scales, zeros = quantize_utils.pseudo_quantize_tensor(
+            lm_head.weight.data,
+            self.quant_config.quant_bits,
+            self.quant_config.group_size,
+            self.quant_config.has_zero_point,
+        )
+
+        layout = getattr(self.quant_config, "layout", "Wt")
+        pack_order = getattr(self.quant_config, "pack_order", "sequential")
+        q_cls = WQLinear_Wt if layout == "Wt" else WQLinear_W
+
+        q_linear = q_cls.from_linear(
+            linear=lm_head,
+            w_bit=self.quant_config.quant_bits,
+            group_size=self.quant_config.group_size,
+            init_only=False,
+            scales=scales,
+            zeros=zeros,
+            backend=self.backend,
+            layout=layout,
+            pack_order=pack_order,
+        )
+        model_utils.set_op_by_name(self.model, "lm_head", q_linear)
+        logger.info("lm_head quantized with AWQ scale search")
+
+        # If embeddings were tied, sync embed_tokens weight with dequantized lm_head
+        # to preserve the semantic symmetry between input and output projections.
+        if getattr(self.model.config, "tie_word_embeddings", False):
+            with torch.no_grad():
+                dequantized_t = q_linear._dequantize_to_weight_t(torch.float16)
+                # dequantized_t shape: (in_features, out_features) = (hidden_dim, vocab_size)
+                self.model.model.embed_tokens.weight.data.copy_(dequantized_t.t())
+            logger.info("embed_tokens.weight synchronized with dequantized lm_head")
+
     def run(self):
         self._quantize_and_replace()
+
+        # Quantize lm_head if requested
+        if "LM_HEAD" in [t.upper() for t in self.quant_config.quant_targets]:
+            self._quantize_lm_head()
 
         return self.model

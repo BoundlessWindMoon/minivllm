@@ -150,6 +150,9 @@ class InferenceProgress:
         )
 
         self._prefill_task = None
+        self._warmup_task = self._progress.add_task(
+            "[yellow]Warmup", total=0, visible=False
+        )
         self._decode_task = None
 
     def start_prefill(self):
@@ -167,6 +170,26 @@ class InferenceProgress:
             self._stream.generated = self._tokenizer.decode(
                 self._generated_ids, skip_special_tokens=True
             )
+
+    def start_warmup(self, total: int):
+        """开始 CUDA Graph warmup 阶段"""
+        if self._enabled:
+            self._progress.update(self._warmup_task, total=total, visible=True)
+
+    def step_warmup(self, n: int = 1):
+        """warmup 进度前进"""
+        if self._enabled:
+            self._progress.update(self._warmup_task, advance=n)
+            self._live.refresh()
+
+    def end_warmup(self):
+        """warmup 完成"""
+        if self._enabled:
+            task = self._progress.tasks[self._warmup_task]
+            self._progress.update(
+                self._warmup_task, advance=task.total - task.completed
+            )
+            self._live.refresh()
 
     def start_decode(self):
         """开始 decode 阶段"""
@@ -207,6 +230,15 @@ class _NoOpProgress:
         pass
 
     def end_prefill(self, first_token_id):
+        pass
+
+    def start_warmup(self, total: int):
+        pass
+
+    def step_warmup(self, n: int = 1):
+        pass
+
+    def end_warmup(self):
         pass
 
     def start_decode(self):

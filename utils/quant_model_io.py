@@ -5,8 +5,8 @@ import torch
 from safetensors.torch import save_file, load_file
 from typing import List
 
-from layers.quanted_linear import WQLinear_GEMM
-from layers.quanted_linear_cached import WQLinear_GEMM_Cached
+from layers.quanted_linear import WQLinear_W
+from layers.quanted_linear_wt import WQLinear_Wt
 from utils.model_utils import set_op_by_name
 from utils.scale_utils import ScaledActivation
 from utils.logger import logger
@@ -14,7 +14,9 @@ from utils.logger import logger
 
 def _get_quantized_layer_names(model) -> List[str]:
     return [
-        name for name, m in model.named_modules() if isinstance(m, WQLinear_GEMM_Cached)
+        name
+        for name, m in model.named_modules()
+        if isinstance(m, (WQLinear_W, WQLinear_Wt))
     ]
 
 
@@ -39,7 +41,8 @@ def save_quantized_model(model, save_path: str, quant_config, original_model_pat
     was_tied = False
     if getattr(model.config, "tie_word_embeddings", False):
         was_tied = True
-        model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.clone())
+        if not isinstance(model.lm_head, (WQLinear_W, WQLinear_Wt)):
+            model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.clone())
 
     state_dict = _ensure_contiguous(model.state_dict())
     save_file(state_dict, os.path.join(save_path, "model.safetensors"))
@@ -49,6 +52,8 @@ def save_quantized_model(model, save_path: str, quant_config, original_model_pat
         "quant_bits": quant_config.quant_bits,
         "group_size": quant_config.group_size,
         "has_zero_point": quant_config.has_zero_point,
+        "layout": getattr(quant_config, 'layout', 'Wt'),
+        "pack_order": getattr(quant_config, 'pack_order', 'sequential'),
         "quantized_layers": _get_quantized_layer_names(model),
         "scaled_activations": _get_scaled_activation_info(model),
         "tie_word_embeddings": was_tied,
@@ -64,15 +69,29 @@ def save_quantized_model(model, save_path: str, quant_config, original_model_pat
 
 
 def _replace_layer_with_quantized(
-    model, layer_name: str, quant_bits: int, group_size: int, backend: str
+    model,
+    layer_name: str,
+    quant_bits: int,
+    group_size: int,
+    backend: str,
+    layout: str = 'Wt',
+    pack_order: str = 'sequential',
 ):
     linear_layer = model.get_submodule(layer_name)
-    q_linear = WQLinear_GEMM_Cached.from_linear(
+    if layout == 'W':
+        q_cls = WQLinear_W
+    elif layout == 'Wt':
+        q_cls = WQLinear_Wt
+    else:
+        raise ValueError(f"Unknown layout: {layout}")
+    q_linear = q_cls.from_linear(
         linear=linear_layer,
         w_bit=quant_bits,
         group_size=group_size,
         init_only=True,
         backend=backend,
+        layout=layout,
+        pack_order=pack_order,
     )
     set_op_by_name(model, layer_name, q_linear)
 
@@ -91,6 +110,8 @@ def _restore_scaled_activation(model, act_name: str, shape: list):
 
 
 def prepare_model_for_quantized_load(model, quant_info: dict, backend: str):
+    layout = quant_info.get("layout", "Wt")
+    pack_order = quant_info.get("pack_order", "sequential")
     for layer_name in quant_info.get("quantized_layers", []):
         _replace_layer_with_quantized(
             model,
@@ -98,6 +119,8 @@ def prepare_model_for_quantized_load(model, quant_info: dict, backend: str):
             quant_info["quant_bits"],
             quant_info["group_size"],
             backend,
+            layout=layout,
+            pack_order=pack_order,
         )
 
     scaled_info = quant_info.get("scaled_activations", {})
@@ -109,18 +132,49 @@ def prepare_model_for_quantized_load(model, quant_info: dict, backend: str):
             _restore_scaled_activation(model, act_name, [1])
 
 
-def load_quantized_weights(model, model_path: str, quant_info: dict):
+def load_quantized_weights(
+    model, model_path: str, quant_info: dict, expected_config=None
+):
     weights_path = os.path.join(model_path, "model.safetensors")
     state_dict = load_file(weights_path, device="cpu")
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    zero_scales_missing = [k for k in missing if k.endswith(".zero_scales")]
+    for key in zero_scales_missing:
+        module = model.get_submodule(key.rsplit(".", 1)[0])
+        with torch.no_grad():
+            module.zero_scales.copy_((module.unpack_zeros * module.scales).half())
+        missing.remove(key)
 
     if missing:
         raise RuntimeError(f"Missing keys when loading quantized model: {missing}")
     if unexpected:
         logger.warning(f"Unexpected keys when loading quantized model: {unexpected}")
 
+    if expected_config is not None:
+        saved_layout = quant_info.get("layout", "Wt")
+        saved_pack = quant_info.get("pack_order", "sequential")
+        expected_layout = getattr(expected_config, "layout", "Wt")
+        expected_pack = getattr(expected_config, "pack_order", "sequential")
+        if saved_layout != expected_layout:
+            raise RuntimeError(
+                f"Layout mismatch: model was saved with layout='{saved_layout}', "
+                f"but config expects layout='{expected_layout}'"
+            )
+        if saved_pack != expected_pack:
+            raise RuntimeError(
+                f"Pack order mismatch: model was saved with pack_order='{saved_pack}', "
+                f"but config expects pack_order='{expected_pack}'"
+            )
+
     if quant_info.get("tie_word_embeddings"):
-        model.lm_head.weight = model.model.embed_tokens.weight
+        quantized_layers = quant_info.get("quantized_layers", [])
+        if "lm_head" not in quantized_layers:
+            model.lm_head.weight = model.model.embed_tokens.weight
+        else:
+            logger.info(
+                "lm_head is quantized; skipping tie_word_embeddings to keep independent quantized weight."
+            )
 
     return model
 

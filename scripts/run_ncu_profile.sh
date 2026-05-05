@@ -57,7 +57,7 @@ export TOKENIZERS_PARALLELISM=false
 # shellcheck disable=SC2086
 set +e
 ncu \
-    --kernel-name "_awq_gemm_kernel" \
+    --kernel-name "_awq_gemm_kernel_wt" \
     --launch-count 10 \
     $NCU_PROFILE_FLAGS \
     --export "$NCU_REPORT" \
