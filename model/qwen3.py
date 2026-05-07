@@ -219,6 +219,8 @@ class Qwen3ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    supports_cuda_graph = True
+
     def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
         self.config = config

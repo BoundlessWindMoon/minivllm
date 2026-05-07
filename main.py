@@ -5,17 +5,66 @@ import torch
 import torch.distributed as dist
 
 from utils.logger import logger
-from datetime import datetime
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer, AutoConfig
 from utils.model_loader import ModelLoader
 from utils.quant_model_io import (
-    is_quantized_model,
     prepare_model_for_quantized_load,
     load_quantized_weights,
 )
 from engine.model_runner import ModelRunner
 from model.qwen3 import Qwen3ForCausalLM
-from utils.config import GlobalConfig
+from utils.config import (
+    GlobalConfig,
+    resolve_data_path,
+    print_runtime_config,
+)
+
+
+def load_model(cfg):
+    data_path = resolve_data_path(cfg)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.path.model_path)
+    backend = cfg.inference.backend
+
+    if cfg.inference.use_quanted_model:
+        if backend == "megakernel_cuda":
+            raise RuntimeError(
+                "Megakernel backend does not support quantized models. "
+                "Please set inference.backend to 'default' when using a quantized model."
+            )
+        logger.info("Loading quantized model weights...")
+        config = AutoConfig.from_pretrained(data_path)
+        config.use_sdpa = cfg.inference.use_sdpa
+        model_skeleton = Qwen3ForCausalLM(config).to(cfg.env.device)
+        with open(os.path.join(data_path, "quant_config.json")) as f:
+            quant_info = json.load(f)
+        prepare_model_for_quantized_load(model_skeleton, quant_info, cfg.quant.backend)
+        load_quantized_weights(
+            model_skeleton, data_path, quant_info, expected_config=cfg.quant
+        )
+        model = model_skeleton
+    else:
+        loader = ModelLoader(data_path)
+        config = AutoConfig.from_pretrained(cfg.path.model_path)
+        config.use_sdpa = cfg.inference.use_sdpa
+        model_skeleton = Qwen3ForCausalLM(config).to(cfg.env.device)
+        model = loader.inject_data(model_skeleton)
+
+    if backend == "megakernel_cuda":
+        logger.info("Switching to CUDA megakernel backend...")
+        from model.qwen3_megakernel import Qwen3MegakernelForCausalLM
+
+        model = Qwen3MegakernelForCausalLM.from_model(model)
+
+        sampling = cfg.inference.sampling
+        if (
+            sampling.sample_method == "greedy"
+            and sampling.temperature == 1.0
+            and sampling.topp == 1.0
+        ):
+            model.greedy_fast_path = True
+            logger.info("Megakernel: enabled greedy fast path (kernel argmax only)")
+
+    return model, tokenizer
 
 
 def main():
@@ -34,27 +83,9 @@ def main():
         rank=cfg.env.distributed.rank,
     )
 
-    logger.info("Loading model...")
-    data_path = cfg.path.data_path or cfg.path.model_path
-    tokenizer = AutoTokenizer.from_pretrained(cfg.path.model_path)
+    print_runtime_config(cfg)
 
-    if is_quantized_model(data_path):
-        logger.info("Detected quantized model, loading quantized weights...")
-        config = AutoConfig.from_pretrained(data_path)
-        config.use_sdpa = cfg.inference.use_sdpa
-        model_skeleton = Qwen3ForCausalLM(config).to(cfg.env.device)
-        with open(os.path.join(data_path, "quant_config.json")) as f:
-            quant_info = json.load(f)
-        prepare_model_for_quantized_load(model_skeleton, quant_info, cfg.quant.backend)
-        load_quantized_weights(model_skeleton, data_path, quant_info, expected_config=cfg.quant)
-        model = model_skeleton
-    else:
-        loader = ModelLoader(data_path)
-        config = AutoConfig.from_pretrained(cfg.path.model_path)
-        config.use_sdpa = cfg.inference.use_sdpa
-        model_skeleton = Qwen3ForCausalLM(config).to(cfg.env.device)
-        model = loader.inject_data(model_skeleton)
-
+    model, tokenizer = load_model(cfg)
     runner = ModelRunner(model=model, tokenizer=tokenizer, cfg=cfg)
 
     text = runner.inference()

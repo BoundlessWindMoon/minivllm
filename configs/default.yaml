@@ -1,25 +1,27 @@
 env:
-  default_dtype: float16
+  default_dtype: bfloat16                  # [float16, bfloat16]
   device: cuda:0
   distributed:
-    backend: nccl
+    backend: nccl                         # [nccl, gloo]
     init_method: tcp://localhost:29500
     rank: 0
     world_size: 1
 
 inference:
+  backend: default                     # [default, megakernel_cuda]
   check_correction: false
   max_new_tokens: 256
   prompt: Hello, I am sakuya, I'm a 24 year old student from UCAS University. I like
     LLM and Infra
   sampling:
-    sample_method: greedy
+    sample_method: greedy                 # [greedy, topp]
     temperature: 1.0
     topk: 1
     topp: 1.0
   use_cuda_graph: true
   use_kvcache: true
   use_profile: true
+  use_quanted_model: false
   use_sdpa: true
 
 path:
@@ -27,11 +29,11 @@ path:
   data_path: ''
   model_path: ~/huggingface/Qwen3-0.6B/
   profile_dir: ./log/profile/
-  quantized_model_path: ~/huggingface/Qwen3-0.6B-AWQ_Cached     # '' or quantized_model_path
-  
+  quantized_model_path: ~/huggingface/Qwen3-0.6B-AWQ_Cached
+
 quant:
   apply_clip: true
-  backend: triton_wt_fused
+  backend: triton_wt_fused                # [gemm, triton, triton_wt, triton_wt_fused]
   calibration:
     data: pileval
     max_seq_length: 512
@@ -39,13 +41,13 @@ quant:
     split: train
     text_column: text
   export_compatible: false
-  group_size: 128
+  group_size: 128                         # [128]
   has_zero_point: true
-  layout: Wt
+  layout: Wt                              # [Wt]
   max_chunk_memory: 1073741824
-  pack_order: sequential
-  quant_bits: 4
-  quant_method: AWQ
+  pack_order: sequential                  # [sequential]
+  quant_bits: 4                           # [4]
+  quant_method: AWQ                       # [AWQ]
   quant_targets:
   - MLP
   - ATTENTION

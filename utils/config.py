@@ -5,6 +5,10 @@ import yaml
 from dacite import from_dict
 from dataclasses import dataclass, field
 from typing import Optional, List
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich import box
 from layers.activation import SiluAndMul
 
 allowed_norms = [
@@ -74,6 +78,8 @@ class InferenceConfig:
     use_cuda_graph: bool = True
     check_correction: bool = False
     use_profile: bool = False
+    backend: str = "default"
+    use_quanted_model: bool = False
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
 
 
@@ -125,3 +131,79 @@ class GlobalConfig:
 
         config = from_dict(data_class=cls, data=yaml_dict)
         return config
+
+
+def resolve_data_path(cfg) -> str:
+    """Resolve the effective data path.
+
+    Priority:
+      1. quantized_model_path  (if use_quanted_model is True)
+      2. data_path             (if set and non-empty)
+      3. model_path            (fallback)
+    """
+    if cfg.inference.use_quanted_model:
+        if not cfg.path.quantized_model_path:
+            raise RuntimeError(
+                "use_quanted_model is True but quantized_model_path is not set"
+            )
+        return cfg.path.quantized_model_path
+    if cfg.path.data_path:
+        return cfg.path.data_path
+    return cfg.path.model_path
+
+
+def is_running_quantized(cfg) -> bool:
+    """Check whether the resolved data path points to a quantized model."""
+    return cfg.inference.use_quanted_model
+
+
+def print_runtime_config(cfg):
+    """Print a rich-formatted summary of the runtime configuration."""
+    table = Table(
+        box=box.SIMPLE_HEAVY,
+        show_header=False,
+        padding=(0, 2),
+        expand=True,
+    )
+    table.add_column("Key", style="cyan", no_wrap=True, ratio=1)
+    table.add_column("Value", style="white", ratio=2)
+
+    data_path = resolve_data_path(cfg)
+    quantized = is_running_quantized(cfg)
+    backend = getattr(cfg.inference, "backend", "default")
+
+    # Path
+    path_label = " (quantized)" if quantized else " (fp16/bf16)"
+    table.add_row("data_path", data_path + path_label)
+
+    # Dtype / Device
+    table.add_row("device", cfg.env.device)
+    table.add_row("dtype", cfg.env.default_dtype)
+
+    # Inference
+    table.add_row("backend", backend)
+    table.add_row("use_sdpa", str(cfg.inference.use_sdpa))
+    table.add_row("use_cuda_graph", str(cfg.inference.use_cuda_graph))
+    table.add_row("use_kvcache", str(cfg.inference.use_kvcache))
+    table.add_row("max_new_tokens", str(cfg.inference.max_new_tokens))
+
+    # Sampling
+    table.add_row("sample_method", cfg.inference.sampling.sample_method)
+    table.add_row("temperature", str(cfg.inference.sampling.temperature))
+    table.add_row("topk", str(cfg.inference.sampling.topk))
+    table.add_row("topp", str(cfg.inference.sampling.topp))
+
+    # Quantization
+    if quantized:
+        table.add_row("quant_bits", str(cfg.quant.quant_bits))
+        table.add_row("quant_backend", cfg.quant.backend)
+        table.add_row("group_size", str(cfg.quant.group_size))
+
+    panel = Panel(
+        table,
+        title="[bold bright_blue]Runtime Configuration[/bold bright_blue]",
+        border_style="bright_blue",
+        padding=(1, 2),
+    )
+    console = Console()
+    console.print(panel)

@@ -67,6 +67,12 @@ class ModelRunner:
             [0, 1], dtype=torch.long, device=self.device
         )
 
+        if self.use_cuda_graph and not getattr(model, "supports_cuda_graph", True):
+            logger.warning(
+                f"{type(model).__name__} does not support CUDA Graph, disabling."
+            )
+            self.use_cuda_graph = False
+
         if self.use_cuda_graph:
             if not torch.cuda.is_available():
                 logger.warning(

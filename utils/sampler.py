@@ -19,6 +19,10 @@ class Sampler(object):
     def sample(self, logits):
         logits = logits[:, -1, :]
 
+        # Fast path: compact logits from kernel argmax (shape [batch, 1])
+        if logits.shape[-1] == 1:
+            return logits.long()
+
         if self.sample_method == "greedy" or self.temperature == 0.0:
             return torch.argmax(logits, dim=-1, keepdim=True)
 
