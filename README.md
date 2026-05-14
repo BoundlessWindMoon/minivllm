@@ -51,7 +51,7 @@ uv pip install -e ".[all]" -i https://pypi.tuna.tsinghua.edu.cn/simple
 Download your model (e.g., Qwen3-0.6B) to your local path.
 
 ```bash
-HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen3-0.6B --local-dir ~/huggingface/Qwen3-1.7B/
+HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen3-0.6B --local-dir ~/huggingface/Qwen3-0.6B/
 ```
 
 Update the path in `configs/default.yaml`:
@@ -126,12 +126,17 @@ All behaviors are controlled by `configs/default.yaml`.
 ```yaml
 inference:
   backend: default                    # [default, megakernel_cuda]
+  megakernel_variant: default         # [default, naive, p0-p10, all_combined]
   use_cuda_graph: true                # [true, false]
   use_kvcache: true                   # [true, false]
   use_sdpa: true                      # [true, false]
   check_correction: false             # [true, false]
   use_profile: false                  # [true, false]
-  use_quantized_model: false            # [true, false]
+  use_quantized_model: false          # [true, false]
+  stop_on_eos: true                   # [true, false]
+  use_chat_template: false            # [true, false]
+  use_thinking: true                  # [true, false] (only when use_chat_template=true)
+  cpu_offload_modules: []             # submodules to keep on CPU, e.g. [model.embed_tokens]
   max_new_tokens: 128                 # integer
   prompt: "Hello, I am ..."           # string
   sampling:
@@ -226,10 +231,15 @@ mini-vllm/
 ├── scripts/               # Evaluation & development scripts
 │   ├── bench_megakernel.py
 │   ├── verify_megakernel.py
+│   ├── e2e_verify.py
 │   ├── analyze_trace.py
 │   ├── parse_ncu_csv.py
 │   ├── run_ncu_profile.sh
 │   ├── ablate.py
+│   ├── collect_ablation.py
+│   ├── convert_hf_awq.py
+│   ├── run_ablation_all.sh
+│   ├── run_variant.sh
 │   └── README.md          # Script usage documentation
 ├── tools/                 # Devops / repository utilities
 │   └── bundle_sync.py
