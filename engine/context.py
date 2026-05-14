@@ -1,3 +1,5 @@
+"""Thread-local inference context: prefill/decode flags and cache metadata."""
+
 from dataclasses import dataclass
 import torch
 

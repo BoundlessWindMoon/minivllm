@@ -4,12 +4,12 @@ Pack or unpack the mini-vllm repo using git bundle.
 
 Usage:
     # On source machine ────────────────────────────────────────────
-    python scripts/bundle_sync.py pack [output.bundle]
+    python tools/bundle_sync.py pack [output.bundle]
 
     # On target machine (after copying the bundle file) ────────────
     # Option A: manual clone, then run setup-remote inside repo
     git clone mini-vllm.bundle mini-vllm
-    cd mini-vllm && python scripts/bundle_sync.py setup-remote
+    cd mini-vllm && python tools/bundle_sync.py setup-remote
 
     # Option B: copy both bundle + this script to target, then run
     python bundle_sync.py unpack mini-vllm.bundle [target-dir]

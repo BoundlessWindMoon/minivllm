@@ -1,3 +1,5 @@
+"""AWQ quantized linear with Wt layout fused kernel."""
+
 import torch
 import torch.nn as nn
 
@@ -112,6 +114,13 @@ class WQLinear_Wt(nn.Module):
         self.shifts = torch.arange(0, 32, self.w_bit, dtype=torch.int32, device=dev)
 
         self.register_buffer("dequantized_weight_t", None)
+
+    def _post_materialize_fixup(self, device):
+        # WHY: self.shifts is a plain attribute (not a buffer); meta-skeleton
+        # leaves it on meta and must be rebuilt on the compute device.
+        self.shifts = torch.arange(
+            0, 32, self.w_bit, dtype=torch.int32, device=device
+        )
 
     @classmethod
     def from_linear(

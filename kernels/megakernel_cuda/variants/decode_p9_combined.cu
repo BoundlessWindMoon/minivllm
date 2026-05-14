@@ -1,8 +1,25 @@
 /**
- * Fused Decode with __ldg() cached reads  (ported from MegaQwen)
+ * decode_p9_combined.cu — P9 prefetch on cumulative (P1+P3+P4+P8) baseline.
  *
- * Full transformer decode pipeline for Qwen3-0.6B in a single persistent
- * kernel with AtomicGridSync + flag-based partial barriers:
+ * Background: my isolated `decode_p9.cu` (forked from P7 = naive + prefetch only,
+ * NO P1/P4/P8) FAILed verify on 4050 because P9 sites #1+#2 prefetch reads
+ * collided with concurrent global writes that aren't isolated by SMEM caches.
+ * Upstream `decode_ldg.cu` runs the SAME 6 prefetch sites correctly because P4
+ * stages attn_out / mlp_intermediate in SMEM (s_attn / s_mlp), so prefetch
+ * reads on the next layer's weights never overlap with in-flight global writes
+ * of the current layer's activations.
+ *
+ * This variant proves that point by fusing:
+ *   - cumulative baseline (P0+P1+P3+P4+P8) from `decode_all_combined.cu`
+ *   - 6 prefetch sites from upstream `decode_ldg.cu`
+ *   - site #4 at P9 placement (post-GU, before grid.sync) -- not P10 placement
+ *
+ * Compare against:
+ *   - `default` (= upstream = effectively P10_combined): site #4 at post-Down
+ *   - `all_combined`: P0+P1+P3+P4+P8 cumulative, no prefetch
+ *   - `p9` (isolated): P9 on naive baseline -- FAILs
+ *
+ * Same transformer pipeline as `decode_ldg.cu`:
  * embed -> 28x(RMSNorm+QKV -> QKNorm+RoPE+Cache -> Attention ->
  * OProj+PostNorm+MLP) -> FinalNorm -> LM Head.
  */
@@ -825,6 +842,41 @@ __device__ void ldg_o_proj_postnorm_mlp(
             }
         }
     }
+    // P9 site #4 (post-GU placement -- relocated from upstream P10's post-Down)
+    // Prefetch next layer QKV during upcoming post-GU grid.sync wait.
+    if (!is_last_layer)
+    {
+        constexpr int q_total = Q_SIZE * HIDDEN_SIZE;
+        constexpr int k_total = KV_SIZE * HIDDEN_SIZE;
+        constexpr int v_total = KV_SIZE * HIDDEN_SIZE;
+        constexpr int combined = q_total + k_total + v_total;
+        int elems_per_block = (combined + num_blocks - 1) / num_blocks;
+        int my_start = block_id * elems_per_block;
+        int my_end = min(my_start + elems_per_block, combined);
+        for (int pos = my_start; pos < my_end;)
+        {
+            if (pos < q_total)
+            {
+                int chunk = min(my_end, q_total) - pos;
+                ldg_prefetch_weights_l2(next_q_weight + pos, chunk);
+                pos += chunk;
+            }
+            else if (pos < q_total + k_total)
+            {
+                int off = pos - q_total;
+                int chunk = min(my_end, q_total + k_total) - pos;
+                ldg_prefetch_weights_l2(next_k_weight + off, chunk);
+                pos += chunk;
+            }
+            else
+            {
+                int off = pos - q_total - k_total;
+                int chunk = my_end - pos;
+                ldg_prefetch_weights_l2(next_v_weight + off, chunk);
+                pos += chunk;
+            }
+        }
+    }
     sm_profiler_event_start(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
     grid.sync();
     sm_profiler_event_end(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
@@ -861,40 +913,6 @@ __device__ void ldg_o_proj_postnorm_mlp(
             sum = ldg_warp_reduce_sum(sum);
             if (lane_id == 0)
                 hidden_out[m] = __float2bfloat16(sum + g_residual[m]);
-        }
-    }
-    // Prefetch next layer QKV during upcoming down proj grid.sync wait
-    if (!is_last_layer)
-    {
-        constexpr int q_total = Q_SIZE * HIDDEN_SIZE;
-        constexpr int k_total = KV_SIZE * HIDDEN_SIZE;
-        constexpr int v_total = KV_SIZE * HIDDEN_SIZE;
-        constexpr int combined = q_total + k_total + v_total;
-        int elems_per_block = (combined + num_blocks - 1) / num_blocks;
-        int my_start = block_id * elems_per_block;
-        int my_end = min(my_start + elems_per_block, combined);
-        for (int pos = my_start; pos < my_end;)
-        {
-            if (pos < q_total)
-            {
-                int chunk = min(my_end, q_total) - pos;
-                ldg_prefetch_weights_l2(next_q_weight + pos, chunk);
-                pos += chunk;
-            }
-            else if (pos < q_total + k_total)
-            {
-                int off = pos - q_total;
-                int chunk = min(my_end, q_total + k_total) - pos;
-                ldg_prefetch_weights_l2(next_k_weight + off, chunk);
-                pos += chunk;
-            }
-            else
-            {
-                int off = pos - q_total - k_total;
-                int chunk = my_end - pos;
-                ldg_prefetch_weights_l2(next_v_weight + off, chunk);
-                pos += chunk;
-            }
         }
     }
     sm_profiler_event_start(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);

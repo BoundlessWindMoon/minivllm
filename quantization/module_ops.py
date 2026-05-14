@@ -1,3 +1,5 @@
+"""Module inspection helpers for quantization targets."""
+
 import torch.nn as nn
 from layers.linear import LinearBase
 

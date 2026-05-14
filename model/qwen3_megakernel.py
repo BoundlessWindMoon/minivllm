@@ -8,7 +8,7 @@ with the same kernel, re-using the KV cache populated during prefill.
 import torch
 from torch import nn
 
-from utils.mega_utils import extract_megakernel_weights
+from model.megakernel_weights import extract_megakernel_weights
 from kernels.megakernel_cuda import _get_module
 
 
@@ -21,7 +21,7 @@ class Qwen3MegakernelForCausalLM(nn.Module):
 
     supports_cuda_graph = False
 
-    def __init__(self, base_model, max_seq_len: int = 4096):
+    def __init__(self, base_model, max_seq_len: int = 4096, variant: str | None = None):
         super().__init__()
         self.config = base_model.config
         self._base = base_model
@@ -41,7 +41,7 @@ class Qwen3MegakernelForCausalLM(nn.Module):
         self._attn_scale = 1.0 / (head_dim**0.5)
 
         # Compile / load CUDA module
-        self._mod = _get_module()
+        self._mod = _get_module(variant)
 
         # Extract and prepare weights
         w = extract_megakernel_weights(base_model)
@@ -120,9 +120,9 @@ class Qwen3MegakernelForCausalLM(nn.Module):
         return cos, sin
 
     @classmethod
-    def from_model(cls, model, max_seq_len: int = 4096):
+    def from_model(cls, model, max_seq_len: int = 4096, variant: str | None = None):
         """Factory: wrap an already-loaded mini-vllm model."""
-        return cls(model, max_seq_len=max_seq_len)
+        return cls(model, max_seq_len=max_seq_len, variant=variant)
 
     def reset(self):
         """Reset decode state and KV cache."""

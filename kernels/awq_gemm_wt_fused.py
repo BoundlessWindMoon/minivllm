@@ -1,3 +1,5 @@
+"""Fused WT-layout AWQ GEMM with dequantization."""
+
 import torch
 import triton
 import triton.language as tl

@@ -15,7 +15,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
-from utils.runner import setup_env, load_eval_model, BaselineRunner, MegakernelRunner
+from engine.eval_runner import setup_env, load_eval_model, BaselineRunner, MegakernelRunner
 
 
 def greedy_decode(runner, tokenizer, prompt: str, num_steps: int):

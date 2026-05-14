@@ -1,3 +1,5 @@
+"""AWQ quantized linear (GEMM / Triton backends)."""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

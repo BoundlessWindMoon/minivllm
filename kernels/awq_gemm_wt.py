@@ -1,3 +1,5 @@
+"""Triton WT-layout AWQ GEMM kernel."""
+
 import torch
 import triton
 import triton.language as tl

@@ -50,21 +50,27 @@ echo ""
 # Prevent huggingface tokenizers from complaining about fork
 export TOKENIZERS_PARALLELISM=false
 
+# Tell ModelRunner to bracket the decode loop with cudaProfilerStart/Stop
+# so NCU (started with --profile-from-start off) only samples decode kernels.
+export MINI_VLLM_NCU_DECODE=1
+
 # Run profiling
-# --launch-count 2: only sample the first 2 matching kernel invocations.
-#   Combined with configs/profile.yaml (max_new_tokens=2), this caps NCU
-#   replay overhead. Tune up if you need more samples.
+# --profile-from-start off: NCU stays idle until cudaProfilerStart fires
+#   (emitted by ModelRunner right before the decode loop). This skips all
+#   load-time / prefill kernels regardless of backend.
+# --launch-count 10: only sample the first 10 kernels after profiling starts.
+#   Tune up if you need more samples.
 # shellcheck disable=SC2086
 set +e
 ncu \
-    --kernel-name "_awq_gemm_kernel_wt" \
+    --profile-from-start off \
     --launch-count 10 \
     $NCU_PROFILE_FLAGS \
     --export "$NCU_REPORT" \
     --csv \
     --page raw \
     --force-overwrite \
-    python "$PROJECT_DIR/run_quantized.py" --config "$PROJECT_DIR/configs/profile.yaml"
+    python "$PROJECT_DIR/main.py" --config "$PROJECT_DIR/configs/profile.yaml"
 NCU_EXIT=$?
 set -e
 

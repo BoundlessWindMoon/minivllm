@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Collect ablation results across variants and emit a Markdown overview.
+
+Reads each ``log/ablation/<variant>/`` directory:
+  - bench.txt        — parses median / min / max decode tok/s
+  - verify.txt       — parses PASSED / FAILED + max diff + min cos_sim
+  - ncu/profile.json — parses key metrics aggregated across megakernel decode kernels
+
+Emits a Markdown document to stdout suitable for ``docs/megakernel_ablation/00_overview.md``.
+"""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+
+KERNEL_KEYS_OF_INTEREST = ("ldg_decode_kernel", "naive_decode_kernel", "decode_kernel")
+
+
+def parse_verify(path: Path) -> dict:
+    if not path.exists():
+        return {"status": "MISSING"}
+    text = path.read_text(errors="replace")
+    passed = "VERIFICATION PASSED" in text
+    failed = "VERIFICATION FAILED" in text
+    m_diff = re.search(r"Max logit diff \(overall\):\s*([0-9eE+\-.]+)", text)
+    m_cos = re.search(r"Min cos_sim \(overall\):\s*([0-9eE+\-.]+)", text)
+    m_match = re.search(r"All tokens match:\s*(True|False)", text)
+    return {
+        "status": "PASS" if passed else ("FAIL" if failed else "UNKNOWN"),
+        "max_diff": float(m_diff.group(1)) if m_diff else None,
+        "min_cos": float(m_cos.group(1)) if m_cos else None,
+        "tokens_match": (m_match.group(1) == "True") if m_match else None,
+    }
+
+
+def parse_bench(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    text = path.read_text(errors="replace")
+    # bench_megakernel uses utils.bench_harness.print_results_table which
+    # prints lines like:
+    #   megakernel | prefill avg=... | decode med=NNN.NN tok/s ...
+    out = {}
+    # Try to grab a "Decode tok/s" style line first
+    # bench_harness format: rows in a table; values like "1234.5"
+    for line in text.splitlines():
+        if "megakernel" not in line.lower():
+            continue
+        # Look for tok/s style values surrounded by whitespace
+        nums = re.findall(r"(\d+\.\d+)", line)
+        if len(nums) >= 4:
+            # Best-effort: collect all numbers in this row
+            out["bench_row"] = line.strip()
+            out["bench_nums"] = [float(n) for n in nums]
+            break
+
+    # Fallback: explicit decode metric pattern
+    for label in ("decode_med", "decode_avg", "decode_min", "decode_max"):
+        m = re.search(rf"{label}\s*[=:]\s*([0-9.]+)", text)
+        if m:
+            out[label] = float(m.group(1))
+    return out
+
+
+def parse_ncu(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text())
+    # Identify megakernel kernel(s) – prefer ldg_decode_kernel / naive_decode_kernel /
+    # decode_kernel. We don't care about lm_head here for the overview.
+    chosen = None
+    for kname in data.keys():
+        for tag in KERNEL_KEYS_OF_INTEREST:
+            if tag in kname:
+                chosen = kname
+                break
+        if chosen:
+            break
+    if not chosen:
+        return {}
+    m = data[chosen]
+    out = {
+        "kernel": chosen,
+        "time_us": m.get("__time_us", 0.0),
+        "dram_mb": m.get("__total_dram_mb", 0.0),
+        "bw_gbps": m.get("__bandwidth_gbps", 0.0),
+    }
+    # SM busy / L2 hit – probe a few common metric names
+    for k, v in m.items():
+        lk = k.lower()
+        if "sm__throughput" in lk and "pct" in lk and "sm_busy" not in out:
+            out["sm_busy"] = v
+        if "l1tex__t_sector_hit_rate" in lk and "l2_hit" not in out:
+            out["l2_hit"] = v
+        if "lts__t_sector_hit_rate" in lk and "l2_hit" not in out:
+            out["l2_hit"] = v
+    return out
+
+
+def fmt(v, spec=".2f", default="—"):
+    if v is None:
+        return default
+    try:
+        return format(v, spec)
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("ablation_dir", help="log/ablation/ root")
+    args = ap.parse_args()
+
+    root = Path(args.ablation_dir)
+    if not root.exists():
+        print(f"# Ablation overview\n\nNo data — `{root}` does not exist.")
+        return
+
+    variants = sorted([p for p in root.iterdir() if p.is_dir()],
+                      key=lambda p: (p.name != "naive", p.name))
+    if not variants:
+        print(f"# Ablation overview\n\nNo variant subdirectories under `{root}`.")
+        return
+
+    rows = []
+    for v in variants:
+        verify = parse_verify(v / "verify.txt")
+        bench = parse_bench(v / "bench.txt")
+        ncu = parse_ncu(v / "ncu" / "profile.json")
+        rows.append((v.name, verify, bench, ncu))
+
+    naive_decode = None
+    for name, _v, b, _n in rows:
+        if name == "naive":
+            naive_decode = b.get("decode_med")
+            if naive_decode is None and b.get("bench_nums"):
+                naive_decode = max(b["bench_nums"])
+            break
+
+    print("# Megakernel ablation overview (RTX 4050 Laptop, sm_89)\n")
+    print("Generated by `scripts/collect_ablation.py`. Each row is one megakernel")
+    print("variant compiled and run via `MINI_VLLM_MK_VARIANT=<key> ...`.\n")
+    print("| Variant | Correctness | tokens_match | max_diff | min_cos | "
+          "decode_med tok/s | vs naive | NCU time us | DRAM MB | BW GB/s | "
+          "SM busy% | L2 hit% |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for name, verify, bench, ncu in rows:
+        decode_med = bench.get("decode_med")
+        if decode_med is None and bench.get("bench_nums"):
+            decode_med = max(bench["bench_nums"])
+        if decode_med is not None and naive_decode:
+            delta_pct = (decode_med - naive_decode) / naive_decode * 100
+            delta = f"{delta_pct:+.1f}%"
+        else:
+            delta = "—"
+        print(f"| {name} | {verify.get('status','—')} | "
+              f"{verify.get('tokens_match','—')} | "
+              f"{fmt(verify.get('max_diff'), '.4f')} | "
+              f"{fmt(verify.get('min_cos'), '.4f')} | "
+              f"{fmt(decode_med, '.1f')} | {delta} | "
+              f"{fmt(ncu.get('time_us'), '.1f')} | "
+              f"{fmt(ncu.get('dram_mb'), '.1f')} | "
+              f"{fmt(ncu.get('bw_gbps'), '.1f')} | "
+              f"{fmt(ncu.get('sm_busy'), '.1f')} | "
+              f"{fmt(ncu.get('l2_hit'), '.1f')} |")
+
+    print("\n## Verdict per round\n")
+    print("Verdicts come from each per-variant Markdown doc under "
+          "`docs/megakernel_ablation/`. This index just shows the bench numbers.\n")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -123,10 +123,6 @@ __device__ __forceinline__ float ldg_silu(float x)
     return x / (1.0f + expf(-x));
 }
 
-// Forward declaration for prefetch (defined in Phase 3)
-__device__ void ldg_prefetch_weights_l2(
-    const __nv_bfloat16 *__restrict__ weights, int num_elements);
-
 // =============================================================================
 // Phase 1: RMSNorm + QKV Projection
 // =============================================================================
@@ -250,31 +246,6 @@ __device__ void ldg_matvec_qkv(
                 *output_ptr = sum;
         }
     }
-    // Prefetch gate+up weights during upcoming grid.sync wait
-    {
-        constexpr int gate_total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
-        constexpr int up_total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
-        constexpr int combined = gate_total + up_total;
-        int elems_per_block = (combined + num_blocks - 1) / num_blocks;
-        int my_start = block_id * elems_per_block;
-        int my_end = min(my_start + elems_per_block, combined);
-        for (int pos = my_start; pos < my_end;)
-        {
-            if (pos < gate_total)
-            {
-                int chunk = min(my_end, gate_total) - pos;
-                ldg_prefetch_weights_l2(gate_weight + pos, chunk);
-                pos += chunk;
-            }
-            else
-            {
-                int off = pos - gate_total;
-                int chunk = my_end - pos;
-                ldg_prefetch_weights_l2(up_weight + off, chunk);
-                pos += chunk;
-            }
-        }
-    }
     sm_profiler_event_start(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
     grid.sync();
     sm_profiler_event_end(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
@@ -393,14 +364,6 @@ __device__ void ldg_qk_norm_rope_cache(
             v_cache_head[i] = __float2bfloat16(v_head[i]);
         }
     }
-    // Prefetch O weight during idle DRAM window
-    {
-        constexpr int o_total = Q_SIZE * HIDDEN_SIZE;
-        int elems_per_block = (o_total + num_blocks - 1) / num_blocks;
-        int my_offset = block_id * elems_per_block;
-        if (my_offset < o_total)
-            ldg_prefetch_weights_l2(o_weight + my_offset, min(elems_per_block, o_total - my_offset));
-    }
     // kv_flag partial barrier: attention blocks (0..ATTN_BLOCKS-1) synchronize
     // using a monotonic atomic counter so all Q/K/V writes are visible before attention
     sm_profiler_event_start(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
@@ -427,24 +390,8 @@ __device__ void ldg_qk_norm_rope_cache(
 }
 
 // =============================================================================
-// Phase 3: Flash-decoding Attention (+ L2 weight prefetch by idle blocks)
+// Phase 3: Flash-decoding Attention
 // =============================================================================
-
-__device__ void ldg_prefetch_weights_l2(
-    const __nv_bfloat16 *__restrict__ weights, int num_elements)
-{
-    // Use PTX prefetch.global.L2::evict_last to hint L2 to keep data persistent.
-    // Each prefetch touches one cache line (128 bytes = 64 bf16 elements).
-    // 256 threads × 128 bytes = 32 KB per iteration = 256 cache lines.
-    // Stride: LDG_BLOCK_SIZE cache lines = 256 * 128 bytes = 32768 bytes per step.
-
-    const char *base = reinterpret_cast<const char *>(weights);
-    int total_bytes = num_elements * 2; // bf16 = 2 bytes
-    for (int offset = threadIdx.x * 128; offset < total_bytes; offset += LDG_BLOCK_SIZE * 128)
-    {
-        asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(base + offset));
-    }
-}
 
 __device__ void ldg_attention(
     AtomicGridSync &grid,
@@ -471,52 +418,10 @@ __device__ void ldg_attention(
 
     const int ATTN_BLOCKS = NUM_Q_HEADS;
 
-    // Idle blocks prefetch current layer's o_proj, gate, up, down weights into L2
+    // Non-attention blocks (16..19): skip the attention compute entirely and
+    // wait on attn_flag so they don't run ahead of o_proj inputs.
     if (block_id >= ATTN_BLOCKS)
     {
-        sm_profiler_event_start(profiler_buffer, SM_PROF_ATTN_PREFETCH, prof_on);
-        int prefetch_block_id = block_id - ATTN_BLOCKS;
-        int num_prefetch_blocks = num_blocks - ATTN_BLOCKS;
-        // Split idle blocks into 4 groups: O, gate, up, down
-        constexpr int num_groups = 4;
-        int group = prefetch_block_id * num_groups / num_prefetch_blocks;
-        int grp_start = group * num_prefetch_blocks / num_groups;
-        int adj = prefetch_block_id - grp_start;
-        int grp_count = ((group + 1) * num_prefetch_blocks / num_groups) - grp_start;
-        if (group == 0)
-        {
-            int total = Q_SIZE * HIDDEN_SIZE;
-            int elems = total / grp_count;
-            int offset = adj * elems;
-            if (offset < total)
-                ldg_prefetch_weights_l2(o_weight + offset, min(elems, total - offset));
-        }
-        else if (group == 1)
-        {
-            int total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
-            int elems = total / grp_count;
-            int offset = adj * elems;
-            if (offset < total)
-                ldg_prefetch_weights_l2(gate_weight + offset, min(elems, total - offset));
-        }
-        else if (group == 2)
-        {
-            int total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
-            int elems = total / grp_count;
-            int offset = adj * elems;
-            if (offset < total)
-                ldg_prefetch_weights_l2(up_weight + offset, min(elems, total - offset));
-        }
-        else
-        {
-            int total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
-            int elems = total / grp_count;
-            int offset = adj * elems;
-            if (offset < total)
-                ldg_prefetch_weights_l2(down_weight + offset, min(elems, total - offset));
-        }
-        sm_profiler_event_end(profiler_buffer, SM_PROF_ATTN_PREFETCH, prof_on);
-        // Non-attention blocks: wait for attention completion via attn_flag
         sm_profiler_event_start(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
         if (threadIdx.x == 0)
         {
@@ -720,14 +625,6 @@ __device__ void ldg_o_proj_postnorm_mlp(
                 g_activations[m] = sum + g_residual[m];
         }
     }
-    // Prefetch down weight during upcoming O proj grid.sync wait
-    {
-        constexpr int down_total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
-        int elems_per_block = (down_total + num_blocks - 1) / num_blocks;
-        int my_offset = block_id * elems_per_block;
-        if (my_offset < down_total)
-            ldg_prefetch_weights_l2(down_weight + my_offset, min(elems_per_block, down_total - my_offset));
-    }
     sm_profiler_event_start(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
     grid.sync();
     sm_profiler_event_end(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
@@ -861,40 +758,6 @@ __device__ void ldg_o_proj_postnorm_mlp(
             sum = ldg_warp_reduce_sum(sum);
             if (lane_id == 0)
                 hidden_out[m] = __float2bfloat16(sum + g_residual[m]);
-        }
-    }
-    // Prefetch next layer QKV during upcoming down proj grid.sync wait
-    if (!is_last_layer)
-    {
-        constexpr int q_total = Q_SIZE * HIDDEN_SIZE;
-        constexpr int k_total = KV_SIZE * HIDDEN_SIZE;
-        constexpr int v_total = KV_SIZE * HIDDEN_SIZE;
-        constexpr int combined = q_total + k_total + v_total;
-        int elems_per_block = (combined + num_blocks - 1) / num_blocks;
-        int my_start = block_id * elems_per_block;
-        int my_end = min(my_start + elems_per_block, combined);
-        for (int pos = my_start; pos < my_end;)
-        {
-            if (pos < q_total)
-            {
-                int chunk = min(my_end, q_total) - pos;
-                ldg_prefetch_weights_l2(next_q_weight + pos, chunk);
-                pos += chunk;
-            }
-            else if (pos < q_total + k_total)
-            {
-                int off = pos - q_total;
-                int chunk = min(my_end, q_total + k_total) - pos;
-                ldg_prefetch_weights_l2(next_k_weight + off, chunk);
-                pos += chunk;
-            }
-            else
-            {
-                int off = pos - q_total - k_total;
-                int chunk = my_end - pos;
-                ldg_prefetch_weights_l2(next_v_weight + off, chunk);
-                pos += chunk;
-            }
         }
     }
     sm_profiler_event_start(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);

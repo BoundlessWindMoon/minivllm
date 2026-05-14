@@ -1,3 +1,5 @@
+"""Low-bit dequantization, pack/unpack, and scaling math."""
+
 import torch
 
 

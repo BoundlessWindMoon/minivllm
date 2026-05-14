@@ -129,30 +129,30 @@ python scripts/analyze_trace.py --compare \
 
 ## Development Utilities
 
-### `bundle_sync.py`
+### `tools/bundle_sync.py`
 
 Pack or unpack the mini-vllm repository using git bundle (useful for offline transfer).
 
 ```bash
 # Pack current branch into a bundle
-python scripts/bundle_sync.py pack mini-vllm.bundle
+python tools/bundle_sync.py pack mini-vllm.bundle
 
 # Unpack on target machine
-python scripts/bundle_sync.py unpack mini-vllm.bundle ./mini-vllm
+python tools/bundle_sync.py unpack mini-vllm.bundle ./mini-vllm
 
 # Restore origin remote in a bundle-cloned repo
-python scripts/bundle_sync.py setup-remote
+python tools/bundle_sync.py setup-remote
 ```
 
 ---
 
-### `ablate_stable_fixed.py`
+### `ablate.py`
 
 Triton kernel ablation study: fixed-config micro-benchmarks for AWQ / FP16 matmul kernels. Used for kernel development and tuning, not for end-to-end model evaluation.
 
 ```bash
 # Run all kernel variants with fixed configs (no autotune)
-python scripts/ablate_stable_fixed.py
+python scripts/ablate.py
 ```
 
 **Note:** This script is an internal development tool. It directly calls Triton kernels without going through the model / engine layers.
@@ -175,7 +175,7 @@ env:
 
 inference:
   backend: default                            # default | megakernel_cuda
-  use_quanted_model: false                    # true to load quantized model
+  use_quantized_model: false                    # true to load quantized model
   use_cuda_graph: true
   use_sdpa: true
 ```

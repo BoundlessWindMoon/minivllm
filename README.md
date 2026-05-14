@@ -49,6 +49,11 @@ uv pip install -e ".[all]" -i https://pypi.tuna.tsinghua.edu.cn/simple
 ### 2. Prepare Model
 
 Download your model (e.g., Qwen3-0.6B) to your local path.
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen3-0.6B --local-dir ~/huggingface/Qwen3-0.6B/
+```
+
 Update the path in `configs/default.yaml`:
 ```yaml
 path:
@@ -75,7 +80,7 @@ python main.py
 **Quantized model inference** — enable quantized model and set the path in config:
 ```yaml
 inference:
-  use_quanted_model: true
+  use_quantized_model: true
 path:
   quantized_model_path: "~/huggingface/Qwen3-0.6B-AWQ_Cached"
 ```
@@ -121,12 +126,17 @@ All behaviors are controlled by `configs/default.yaml`.
 ```yaml
 inference:
   backend: default                    # [default, megakernel_cuda]
+  megakernel_variant: default         # [default, naive, p0-p10, all_combined]
   use_cuda_graph: true                # [true, false]
   use_kvcache: true                   # [true, false]
   use_sdpa: true                      # [true, false]
   check_correction: false             # [true, false]
   use_profile: false                  # [true, false]
-  use_quanted_model: false            # [true, false]
+  use_quantized_model: false          # [true, false]
+  stop_on_eos: true                   # [true, false]
+  use_chat_template: false            # [true, false]
+  use_thinking: true                  # [true, false] (only when use_chat_template=true)
+  cpu_offload_modules: []             # submodules to keep on CPU, e.g. [model.embed_tokens]
   max_new_tokens: 128                 # integer
   prompt: "Hello, I am ..."           # string
   sampling:
@@ -189,8 +199,13 @@ mini-vllm/
 ├── configs/               # YAML configuration files
 │   ├── default.yaml
 │   └── profile.yaml
-├── engine/                # Inference engine & runner
-│   └── model_runner.py
+├── engine/                # Inference engine & runtime
+│   ├── loader.py          # Top-level model loader
+│   ├── model_runner.py    # Inference loop (prefill + decode)
+│   ├── eval_runner.py     # Baseline / megakernel eval runners
+│   ├── sampler.py
+│   ├── context.py
+│   └── progress.py
 ├── kernels/               # Custom kernels (Triton & CUDA)
 │   ├── awq_gemm.py
 │   ├── awq_gemm_wt.py
@@ -199,28 +214,42 @@ mini-vllm/
 │       ├── decode_ldg.cu
 │       ├── decode_wrapper.cpp
 │       └── sm_profiler.h
-├── layers/                # Built-in layers (Attention, MLP, Quantized Linear)
+├── layers/                # Built-in dense layers (Attention, MLP, RMSNorm, ...)
+├── quantization/          # AWQ search, quantized linear layers, checkpoint I/O
+│   ├── awq.py
+│   ├── checkpoint.py
+│   ├── quantized_linear.py
+│   ├── quantized_linear_wt.py
+│   ├── quant_math.py
+│   ├── scale.py
+│   ├── module_ops.py
+│   └── calibration.py
 ├── model/                 # Model architectures
 │   ├── qwen3.py
 │   ├── qwen3_megakernel.py
 │   └── megakernel_weights.py
-├── scripts/               # Evaluation & utility scripts
+├── scripts/               # Evaluation & development scripts
 │   ├── bench_megakernel.py
 │   ├── verify_megakernel.py
+│   ├── e2e_verify.py
 │   ├── analyze_trace.py
 │   ├── parse_ncu_csv.py
 │   ├── run_ncu_profile.sh
-│   ├── ablate_stable_fixed.py
-│   ├── bundle_sync.py
+│   ├── ablate.py
+│   ├── collect_ablation.py
+│   ├── convert_hf_awq.py
+│   ├── run_ablation_all.sh
+│   ├── run_variant.sh
 │   └── README.md          # Script usage documentation
-├── utils/                 # Config, Logger, Loader, Runner, Quantizer
-│   ├── runner.py          # Shared model runners (baseline + megakernel)
-│   ├── bench_harness.py   # Shared benchmark harness
+├── tools/                 # Devops / repository utilities
+│   └── bundle_sync.py
+├── utils/                 # Cross-cutting helpers (Config, Logger, CPU offload, ...)
 │   ├── config.py
-│   ├── context.py
 │   ├── logger.py
 │   ├── model_loader.py
-│   └── ...
+│   ├── cpu_offload.py
+│   ├── bench_harness.py
+│   └── verifier.py
 ├── main.py                # Entry point: inference (fp16 / bf16 / quantized / megakernel)
 └── quant.py               # Entry point: AWQ quantization calibration
 ```

@@ -15,7 +15,7 @@ from transformers import AutoConfig
 
 from utils.config import GlobalConfig
 from utils.model_loader import ModelLoader
-from utils.context import set_context
+from engine.context import set_context
 from model.qwen3 import Qwen3ForCausalLM
 from model.qwen3_megakernel import Qwen3MegakernelForCausalLM
 
@@ -83,7 +83,9 @@ def load_eval_model(config_or_path: str | GlobalConfig | None = None, backend: s
     model = loader.inject_data(model_skeleton)
 
     if backend == "megakernel_cuda":
-        model = Qwen3MegakernelForCausalLM.from_model(model)
+        model = Qwen3MegakernelForCausalLM.from_model(
+            model, variant=cfg.inference.megakernel_variant
+        )
 
     model.eval()
     return model
