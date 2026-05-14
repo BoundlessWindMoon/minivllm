@@ -8,35 +8,50 @@ env:
     world_size: 1
 
 inference:
-  backend: default                     # [default, megakernel_cuda]
+  backend: default             # [default, megakernel_cuda]
+  megakernel_variant: default             # [default, naive, p0, p1, p3, p4, p6, p7, p8, p9, p9_combined, p10, all_combined]
   check_correction: false
   max_new_tokens: 256
-  prompt: Hello, I am sakuya, I'm a 24 year old student from UCAS University. I like
-    LLM and Infra
+  prompt: Hello, I am sakuya, I'm a 24 year old student from UCAS University. I like LLM and Infra
+  # prompt: "我来提问题，你来回答。只需要回答ABCD。问题.1+2=?选项:A:0，B:1,C:2,D:3"
   sampling:
-    sample_method: greedy                 # [greedy, topp]
-    temperature: 1.0
-    topk: 1
+    sample_method: topp                 # [greedy, topp]
+    temperature: 1.5
+    topk: 10
     topp: 1.0
   use_cuda_graph: true
   use_kvcache: true
-  use_profile: true
-  use_quanted_model: false
+  use_profile: false
+  use_quantized_model: true
   use_sdpa: true
+  # Stop decoding when the sampled token hits model.config.eos_token_id or tokenizer.eos_token_id.
+  stop_on_eos: true
+  # Wrap prompt as a single user-turn chat message using tokenizer.chat_template.
+  # Needed for chat/instruct models (Qwen3, etc.) so they emit <|im_end|> at the end of their reply.
+  use_chat_template: true
+  # When chat template is on, control whether to enable the model's built-in thinking block
+  # (`<think>...</think>`). True = let it reason first (better on reasoning tasks, more tokens).
+  # False = direct answer (faster, may be worse on hard problems). Ignored if use_chat_template=false.
+  use_thinking: true
+  # Submodule paths to keep on CPU; pre/post forward hooks shuttle I/O across PCIe.
+  # Use this to fit large models on a small GPU. Set to [] to disable.
+  cpu_offload_modules:
+    - model.embed_tokens
+    - lm_head
 
 path:
   baseline_model_path: ~/huggingface/baseline/
   data_path: ''
   model_path: ~/huggingface/Qwen3-0.6B/
   profile_dir: ./log/profile/
-  quantized_model_path: ~/huggingface/Qwen3-0.6B-AWQ_Cached
+  quantized_model_path: ~/huggingface/Qwen3-8B-AWQ_Cached
 
 quant:
   apply_clip: true
   backend: triton_wt_fused                # [gemm, triton, triton_wt, triton_wt_fused]
   calibration:
     data: pileval
-    max_seq_length: 512
+    max_seq_length: 4096
     n_samples: 32
     split: train
     text_column: text

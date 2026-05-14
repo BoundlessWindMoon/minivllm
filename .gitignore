@@ -1,4 +1,6 @@
 tmp/
 log/
+docs/
+swanlog/
 *.pyc
 *.egg-info

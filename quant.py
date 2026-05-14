@@ -1,3 +1,5 @@
+"""Entry point: AWQ quantization pipeline with YAML config."""
+
 import os
 import sys
 import argparse
@@ -10,8 +12,8 @@ sys.path.append(ROOT_DIR)
 from utils.logger import logger
 from utils.config import GlobalConfig
 from utils.model_loader import ModelLoader
-from utils.quantizer import Quantizer
-from utils.quant_model_io import save_quantized_model
+from quantization.awq import Quantizer
+from quantization.checkpoint import save_quantized_model
 
 from transformers import AutoTokenizer, AutoConfig
 from model.qwen3 import Qwen3ForCausalLM

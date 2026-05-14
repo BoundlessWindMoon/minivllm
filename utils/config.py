@@ -1,23 +1,15 @@
+"""YAML-backed nested dataclass configuration."""
+
 import os
 import torch
-import torch.nn as nn
 import yaml
 from dacite import from_dict
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import List
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich import box
-from layers.activation import SiluAndMul
-
-allowed_norms = [
-    nn.LayerNorm,
-]
-
-allowed_act_fns = [
-    SiluAndMul,
-]
 
 
 @dataclass
@@ -79,7 +71,12 @@ class InferenceConfig:
     check_correction: bool = False
     use_profile: bool = False
     backend: str = "default"
-    use_quanted_model: bool = False
+    megakernel_variant: str = "default"
+    use_quantized_model: bool = False
+    stop_on_eos: bool = True
+    use_chat_template: bool = False
+    use_thinking: bool = True
+    cpu_offload_modules: List[str] = field(default_factory=list)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
 
 
@@ -137,14 +134,14 @@ def resolve_data_path(cfg) -> str:
     """Resolve the effective data path.
 
     Priority:
-      1. quantized_model_path  (if use_quanted_model is True)
+      1. quantized_model_path  (if use_quantized_model is True)
       2. data_path             (if set and non-empty)
       3. model_path            (fallback)
     """
-    if cfg.inference.use_quanted_model:
+    if cfg.inference.use_quantized_model:
         if not cfg.path.quantized_model_path:
             raise RuntimeError(
-                "use_quanted_model is True but quantized_model_path is not set"
+                "use_quantized_model is True but quantized_model_path is not set"
             )
         return cfg.path.quantized_model_path
     if cfg.path.data_path:
@@ -154,7 +151,7 @@ def resolve_data_path(cfg) -> str:
 
 def is_running_quantized(cfg) -> bool:
     """Check whether the resolved data path points to a quantized model."""
-    return cfg.inference.use_quanted_model
+    return cfg.inference.use_quantized_model
 
 
 def print_runtime_config(cfg):
@@ -182,9 +179,17 @@ def print_runtime_config(cfg):
 
     # Inference
     table.add_row("backend", backend)
+    if backend == "megakernel_cuda":
+        env_variant = os.environ.get("MINI_VLLM_MK_VARIANT")
+        variant = env_variant or getattr(cfg.inference, "megakernel_variant", "default")
+        suffix = " (via MINI_VLLM_MK_VARIANT)" if env_variant else ""
+        table.add_row("megakernel_variant", variant + suffix)
     table.add_row("use_sdpa", str(cfg.inference.use_sdpa))
     table.add_row("use_cuda_graph", str(cfg.inference.use_cuda_graph))
     table.add_row("use_kvcache", str(cfg.inference.use_kvcache))
+    table.add_row("use_chat_template", str(cfg.inference.use_chat_template))
+    if cfg.inference.use_chat_template:
+        table.add_row("use_thinking", str(cfg.inference.use_thinking))
     table.add_row("max_new_tokens", str(cfg.inference.max_new_tokens))
 
     # Sampling
