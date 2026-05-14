@@ -1,8 +1,10 @@
+"""Loguru-based logging with file and optional console sinks."""
+
 import os
 import sys
 from datetime import datetime
 from loguru import logger
-from utils.progress import CONSOLE
+from engine.progress import CONSOLE
 
 logger.remove()
 
@@ -12,19 +14,7 @@ os.makedirs(log_dir, exist_ok=True)
 
 
 def rich_sink(message):
-
     CONSOLE.print(message, end="")
-
-
-# logger.add(
-#     rich_sink,
-#     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-#     "<level>{level: <8}</level> | "
-#     "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
-#     "<level>{message}</level>",
-#     level="DEBUG",
-#     colorize=True,
-# )
 
 
 logger.add(

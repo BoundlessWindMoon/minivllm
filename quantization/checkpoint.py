@@ -1,3 +1,5 @@
+"""Save/load quantized checkpoints and weight packing."""
+
 import os
 import json
 import shutil
@@ -5,10 +7,10 @@ import torch
 from safetensors.torch import save_file, load_file
 from typing import List
 
-from layers.quanted_linear import WQLinear_W
-from layers.quanted_linear_wt import WQLinear_Wt
-from utils.model_utils import set_op_by_name
-from utils.scale_utils import ScaledActivation
+from quantization.quantized_linear import WQLinear_W
+from quantization.quantized_linear_wt import WQLinear_Wt
+from quantization.module_ops import set_op_by_name
+from quantization.scale import ScaledActivation
 from utils.logger import logger
 
 
@@ -132,12 +134,43 @@ def prepare_model_for_quantized_load(model, quant_info: dict, backend: str):
             _restore_scaled_activation(model, act_name, [1])
 
 
+def _shard_paths(model_path: str) -> list[str]:
+    """Resolve a list of safetensors files to load, in order.
+
+    Supports both single-file (`model.safetensors`) and multi-shard
+    (`model.safetensors.index.json` + `model-*-of-*.safetensors`) layouts.
+    """
+    single = os.path.join(model_path, "model.safetensors")
+    if os.path.exists(single):
+        return [single]
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.exists(index_path):
+        raise FileNotFoundError(
+            f"No model.safetensors or model.safetensors.index.json in {model_path}"
+        )
+    with open(index_path) as f:
+        idx = json.load(f)
+    shard_files = sorted(set(idx["weight_map"].values()))
+    return [os.path.join(model_path, s) for s in shard_files]
+
+
 def load_quantized_weights(
     model, model_path: str, quant_info: dict, expected_config=None
 ):
-    weights_path = os.path.join(model_path, "model.safetensors")
-    state_dict = load_file(weights_path, device="cpu")
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    shards = _shard_paths(model_path)
+    # Load and apply shard-by-shard so peak host RAM is bounded by one shard
+    # instead of the full state_dict.
+    all_unexpected: list[str] = []
+    loaded_keys: set[str] = set()
+    for shard_path in shards:
+        sd_shard = load_file(shard_path, device="cpu")
+        _, unexpected = model.load_state_dict(sd_shard, strict=False)
+        loaded_keys.update(sd_shard.keys())
+        all_unexpected.extend(unexpected)
+        del sd_shard
+
+    expected_keys = set(model.state_dict().keys())
+    missing = list(expected_keys - loaded_keys)
 
     zero_scales_missing = [k for k in missing if k.endswith(".zero_scales")]
     for key in zero_scales_missing:
@@ -148,8 +181,8 @@ def load_quantized_weights(
 
     if missing:
         raise RuntimeError(f"Missing keys when loading quantized model: {missing}")
-    if unexpected:
-        logger.warning(f"Unexpected keys when loading quantized model: {unexpected}")
+    if all_unexpected:
+        logger.warning(f"Unexpected keys when loading quantized model: {all_unexpected}")
 
     if expected_config is not None:
         saved_layout = quant_info.get("layout", "Wt")

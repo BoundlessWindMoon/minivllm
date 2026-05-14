@@ -1,9 +1,11 @@
+"""Sharded Safetensors loader with memory-mapped read."""
+
 import os
 from glob import glob
 import torch
 from torch import nn
 from safetensors import safe_open
-from utils.progress import ModelLoadProgress
+from engine.progress import ModelLoadProgress
 
 
 class ModelLoader:

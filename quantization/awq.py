@@ -1,10 +1,12 @@
+"""AWQ quantizer: search scales, apply clip, replace layers."""
+
 import torch
 import torch.nn as nn
 import functools
 
 
 from utils.logger import logger
-from utils.calib_data import get_calib_dataset
+from quantization.calibration import get_calib_dataset
 from typing import Dict, List, Optional, Tuple, Union
 
 from collections import defaultdict
@@ -29,8 +31,8 @@ from layers.linear import (
     LinearBase,
 )
 from layers.embed_head import ParallelLMHead
-from layers.quanted_linear import WQLinear_W
-from layers.quanted_linear_wt import WQLinear_Wt
+from quantization.quantized_linear import WQLinear_W
+from quantization.quantized_linear_wt import WQLinear_Wt
 from model.qwen3 import (
     Qwen3DecoderLayer,
     Qwen3Attention,
@@ -39,9 +41,9 @@ from model.qwen3 import (
 
 # Import decoupled utilities
 from utils.config import QuantConfig, EnvironmentConfig, CalibConfig
-from utils import model_utils
-from utils import quantize_utils
-from utils import scale_utils
+from quantization import module_ops as model_utils
+from quantization import quant_math as quantize_utils
+from quantization import scale as scale_utils
 
 
 class Quantizer:

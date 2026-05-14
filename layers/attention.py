@@ -1,3 +1,5 @@
+"""Attention layer implementations (Flash/SimpleAttention + KV cache)."""
+
 import torch
 from torch import nn
 import triton
@@ -5,7 +7,7 @@ import triton.language as tl
 import torch.nn.functional as F
 
 from utils.logger import logger
-from utils.context import get_context
+from engine.context import get_context
 
 
 @triton.jit

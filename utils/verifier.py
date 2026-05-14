@@ -1,3 +1,5 @@
+"""Numerical correctness verifier: PPL and greedy-decode match."""
+
 import os
 import json
 import math

@@ -1,3 +1,5 @@
+"""Sampling utilities: greedy, top-p, and temperature scaling."""
+
 import torch
 from typing import Optional
 import torch.nn.functional as F

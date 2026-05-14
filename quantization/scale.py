@@ -1,9 +1,16 @@
+"""Scale tensor creation and per-channel scaling helpers."""
+
 import torch
 import torch.nn as nn
 
+from layers.activation import SiluAndMul
 from layers.linear import LinearBase
-from utils.config import allowed_norms, allowed_act_fns
-from utils.model_utils import get_op_by_name
+from quantization.module_ops import get_op_by_name
+
+
+# Whitelist of modules eligible for AWQ scale application.
+allowed_norms = [nn.LayerNorm]
+allowed_act_fns = [SiluAndMul]
 
 
 class ScaledActivation(nn.Module):

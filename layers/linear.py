@@ -1,3 +1,5 @@
+"""FP/bf16 linear layers."""
+
 import torch
 from torch import nn
 import torch.nn.functional as F
