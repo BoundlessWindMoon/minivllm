@@ -1,10 +1,13 @@
+"""ModelRunner: orchestrates prefill, decode, CUDA graph, sampling, and verification."""
+
+import os
 import torch
 import warnings
 
 from utils.logger import logger
-from utils.context import get_context, set_context
-from utils.progress import InferenceProgress
-from utils.sampler import Sampler
+from engine.context import get_context, set_context
+from engine.progress import InferenceProgress
+from engine.sampler import Sampler
 
 try:
     from utils.verifier import Verifier
@@ -22,20 +25,6 @@ class ModelRunner:
         self,
         model,
         tokenizer,
-        # max_new_tokens,
-        # prompt="",
-        # check_correction=False,
-        # use_profile=False,
-        # use_kvcache=True,
-        # use_progress=True,
-        # sample_method: Optional[str] = "greedy",
-        # temperature: Optional[float] = 1.0,
-        # topk: int = 1,
-        # topp: float = 1.0,
-        # baseline_model_path: Optional[str] = None,
-        # baseline_model_dtype: Optional[torch.dtype] = torch.bfloat16,
-        # device="cuda:0",
-        # profile_dir: str = "./log/profile/",
         cfg: GlobalConfig,
     ):
         self.model = model
@@ -48,12 +37,30 @@ class ModelRunner:
         self.use_profile = cfg.inference.use_profile
         self.use_kvcache = cfg.inference.use_kvcache
         self.profile_dir = cfg.path.profile_dir
+        self.stop_on_eos = getattr(cfg.inference, "stop_on_eos", True)
+        self.eos_token_ids = self._collect_eos_ids() if self.stop_on_eos else set()
 
         self.use_progress = True
 
         self.prompt = cfg.inference.prompt
-        inputs = self.tokenizer(self.prompt, return_tensors="pt").to(self.device)
-        self.input_ids = inputs["input_ids"].to(self.device)
+        use_chat = getattr(cfg.inference, "use_chat_template", False)
+        use_thinking = getattr(cfg.inference, "use_thinking", True)
+        has_tmpl = getattr(self.tokenizer, "chat_template", None) is not None
+        if use_chat and has_tmpl:
+            self.input_ids = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": self.prompt}],
+                add_generation_prompt=True,
+                enable_thinking=use_thinking,
+                return_tensors="pt",
+            ).to(self.device)
+        else:
+            if use_chat and not has_tmpl:
+                logger.warning(
+                    "use_chat_template=True but tokenizer has no chat_template; "
+                    "falling back to raw tokenization."
+                )
+            inputs = self.tokenizer(self.prompt, return_tensors="pt").to(self.device)
+            self.input_ids = inputs["input_ids"].to(self.device)
         self.position_ids = torch.arange(
             self.input_ids.shape[1], device=self.device
         ).unsqueeze(0)
@@ -197,6 +204,7 @@ class ModelRunner:
 
                 current_tokens = 0
                 decode_pass = False
+                stopped_by_eos = next_token.item() in self.eos_token_ids
 
                 if self.use_cuda_graph:
                     self._decode_input_ids.copy_(next_token.reshape(1, 1))
@@ -205,7 +213,11 @@ class ModelRunner:
                     pbar.end_warmup()
 
                 pbar.start_decode()
-                while current_tokens < max_new_tokens:
+                ncu_decode = os.environ.get("MINI_VLLM_NCU_DECODE") == "1"
+                if ncu_decode:
+                    torch.cuda.synchronize()
+                    torch.cuda.cudart().cudaProfilerStart()
+                while current_tokens < max_new_tokens and not stopped_by_eos:
                     logits = self.run_decode(next_token, past_len)
 
                     if self.prof:
@@ -245,9 +257,16 @@ class ModelRunner:
                     past_len += 1
                     current_tokens += 1
                     pbar.step_decode(next_token.item())
+                    if next_token.item() in self.eos_token_ids:
+                        stopped_by_eos = True
+                        break
+
+                if ncu_decode:
+                    torch.cuda.synchronize()
+                    torch.cuda.cudart().cudaProfilerStop()
 
                 if (
-                    current_tokens == max_new_tokens
+                    (current_tokens == max_new_tokens or stopped_by_eos)
                     and self.check_correction
                     and self.verifier is not None
                 ):
@@ -373,3 +392,22 @@ class ModelRunner:
         new_position_ids = position_ids[:, -1:] + 1
         new_position_ids = torch.cat([position_ids, new_position_ids], dim=-1)
         return new_input_ids, new_position_ids
+
+    def _collect_eos_ids(self) -> set[int]:
+        """Union EOS ids from model.config.eos_token_id and tokenizer.eos_token_id."""
+        ids: set[int] = set()
+        cfg_eos = getattr(getattr(self.model, "config", None), "eos_token_id", None)
+        if isinstance(cfg_eos, (list, tuple)):
+            ids.update(int(x) for x in cfg_eos if x is not None)
+        elif cfg_eos is not None:
+            ids.add(int(cfg_eos))
+        tok_eos = getattr(self.tokenizer, "eos_token_id", None)
+        if tok_eos is not None:
+            ids.add(int(tok_eos))
+        gen = getattr(self.model, "generation_config", None)
+        gen_eos = getattr(gen, "eos_token_id", None) if gen is not None else None
+        if isinstance(gen_eos, (list, tuple)):
+            ids.update(int(x) for x in gen_eos if x is not None)
+        elif gen_eos is not None:
+            ids.add(int(gen_eos))
+        return ids

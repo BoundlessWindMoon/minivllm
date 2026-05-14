@@ -1,3 +1,5 @@
+"""RoPE (Rotary Position Embedding) for Qwen3."""
+
 from functools import lru_cache
 import torch
 from torch import nn
@@ -24,15 +26,36 @@ class RotaryEmbedding(nn.Module):
         base: float,
     ) -> None:
         super().__init__()
-        self.head_size = head_size
         assert rotary_dim == head_size
-        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
-        t = torch.arange(max_position_embeddings, dtype=torch.float)
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.register_buffer(
+            "cos_sin_cache",
+            self._build_cos_sin_cache(device=None),
+            persistent=False,
+        )
+
+    def _build_cos_sin_cache(self, device=None) -> torch.Tensor:
+        inv_freq = 1.0 / (
+            self.base
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device=device)
+                / self.rotary_dim
+            )
+        )
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float, device=device)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos()
-        sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
-        self.register_buffer("cos_sin_cache", cache, persistent=False)
+        return torch.cat((freqs.cos(), freqs.sin()), dim=-1).unsqueeze_(1)
+
+    def _post_materialize_fixup(self, device):
+        # WHY: cos_sin_cache is persistent=False; not in state_dict, never
+        # restored by load_state_dict — rebuild after materialization replaces
+        # it with empty_like garbage.
+        fresh = self._build_cos_sin_cache(device=device).to(self.cos_sin_cache.dtype)
+        with torch.no_grad():
+            self.cos_sin_cache.copy_(fresh)
 
     @torch.compile
     def forward(

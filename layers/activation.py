@@ -1,25 +1,7 @@
-# import torch
-# from torch import nn
-# import torch.nn.functional as F
-
-
-# class SiluAndMul(nn.Module):
-
-#     def __init__(self, scales=None):
-#         super().__init__()
-#         self.scales = scales
-
-#     @torch.compile
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         x, y = x.chunk(2, -1)
-#         out = F.silu(x) * y
-#         if self.scales is not None:
-#             out = out / self.scales.view(1, 1, -1).to(x.device)
-#         return out
+"""Triton-accelerated SiLU-and-Mul activation."""
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 

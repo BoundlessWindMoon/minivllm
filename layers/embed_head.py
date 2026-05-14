@@ -1,9 +1,11 @@
+"""Embedding and language-model head layers."""
+
 import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from utils.context import get_context
+from engine.context import get_context
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -18,7 +20,6 @@ class VocabParallelEmbedding(nn.Module):
             self.tp_rank = dist.get_rank()
             self.tp_size = dist.get_world_size()
         except (ValueError, RuntimeError):
-            # 如果没有初始化分布式环境，使用单进程设置
             self.tp_rank = 0
             self.tp_size = 1
         assert num_embeddings % self.tp_size == 0
