@@ -1,29 +1,63 @@
 /**
- * Fused Decode with __ldg() cached reads  (ported from MegaQwen)
+ * decode_p9.cu — naive + P3 + P6 placement + P7 (PTX evict_last) + P9
+ * (fire-and-forget PTX prefetches at the 4 sync windows).
  *
- * Full transformer decode pipeline for Qwen3-0.6B in a single persistent
- * kernel with AtomicGridSync + flag-based partial barriers:
- * embed -> 28x(RMSNorm+QKV -> QKNorm+RoPE+Cache -> Attention ->
- * OProj+PostNorm+MLP) -> FinalNorm -> LM Head.
+ * Forked from ``decode_p7.cu``. Adds 4 additional prefetch sites: at every
+ * grid sync edge, the blocks that are *about* to spin-wait first issue a
+ * fire-and-forget PTX prefetch for the next phase's working set. The
+ * helper body (``prefetch.global.L2::evict_last`` at 128-byte stride) is the
+ * same as P7 — only the *placement* changes.
+ *
+ * P9 prefetch sites (in execution order, layer by layer):
+ *   1. End of phase 1 (after QKV matvec, before its full grid.sync): all
+ *      blocks split the combined gate+up weight (12 MB) into N pieces and
+ *      prefetch their slice. The sync wait that follows is presumed long
+ *      enough for the prefetch to make progress.
+ *   2. End of phase 2 (after QK norm + RoPE + KV cache write, before the
+ *      kv_flag partial barrier): all blocks split the o_proj weight (4 MB)
+ *      into N pieces and prefetch their slice.
+ *   3. End of phase 4 / O-proj segment (after O proj + residual add, before
+ *      its full grid.sync): all blocks split the down weight (6 MB) into
+ *      N pieces and prefetch their slice.
+ *   4. End of phase 4 / gate-up segment (after gate/up matvec, before its
+ *      grid.sync): all blocks split the *next* layer's Q+K+V weight (8 MB
+ *      combined) into N pieces and prefetch their slice. Skipped on the
+ *      last layer. This is the "P9 site-#4 placement" (post-GU). P10 moves
+ *      this same prefetch to the post-Down sync window.
+ *
+ * Site 1+2+3+4 = 12 + 4 + 6 + 8 = 30 MB of prefetch per layer (vs P6/P7's
+ * 22 MB from idle-block attention prefetch). Combined with P6/P7's
+ * attention-shadow prefetch (still active here for the down weight!), there
+ * is intentional overlap — P9 expects the 4 sync windows to absorb the
+ * extra DRAM traffic that idle-block prefetch could not.
+ *
+ * On a GPU with sufficient L2 (5060 Ti, 32 MB) and a DRAM bandwidth that
+ * isn't already pegged, this should claw back the per-layer DRAM stalls
+ * by overlapping prefetch with sync-spin time. On the 4050 (24 MB L2,
+ * DRAM already at 136% NCU saturation by P3), the extra prefetch volume
+ * will (predicted) make the situation worse.
+ *
+ * What is NOT in P9 (these are later rounds):
+ *   - Site-#4 relocation from post-GU to post-Down — that's P10.
+ *
+ * P9 keeps these P7 / P6 / P3 / naive behaviours:
+ *   - AtomicGridSync + partial barriers from P3.
+ *   - Idle-block prefetch branch from P6 (using P7's evict_last PTX).
+ *   - Block-0-only RMSNorm with ``g_normalized`` broadcast (P1 reverted).
+ *   - Scalar bf16 weight / KV-cache loads (P4 reverted).
+ *   - No SMEM padding (P8 reverted).
+ *
+ * The launch surface (``extern "C" launch_ldg_decode[_with_logits]``) is
+ * byte-identical with naive / decode_ldg.cu so ``decode_wrapper.cpp`` works
+ * unchanged.
  */
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include "sm_profiler.h"
 
-// sm-profiler event IDs
-#define SM_PROF_EMBEDDING 0
-#define SM_PROF_QKV_PROJ 1
-#define SM_PROF_QK_NORM_ROPE 2
-#define SM_PROF_ATTN_COMPUTE 3
-#define SM_PROF_ATTN_PREFETCH 4
-#define SM_PROF_O_PROJ_MLP 5
-#define SM_PROF_FINAL_NORM 6
-#define SM_PROF_GRID_SYNC 7
-#define SM_PROF_NUM_EVENTS 8
-
 // =============================================================================
-// Configuration & model constants
+// Configuration & model constants (must match decode_ldg.cu)
 // =============================================================================
 
 constexpr int WARP_SIZE = 32;
@@ -40,13 +74,7 @@ constexpr int LDG_BLOCK_SIZE = 256;
 constexpr int LDG_NUM_WARPS = LDG_BLOCK_SIZE / WARP_SIZE; // 8
 constexpr float LDG_RMS_EPS = 1e-6f;
 
-// Shared memory bank conflict padding: 1 pad per 8 elements (stride 9)
-// Reduces 8-way bank conflicts to ≤2-way in float4 matvec reads.
-// Safe for float4: each lane's 8 consecutive elements never cross a pad slot.
-#define SMEM_PAD_IDX(i) ((i) + (i) / 8)
-#define SMEM_PAD_SIZE(n) ((n) + (n) / 8)
-
-// LM head
+// LM head – kept identical to decode_ldg.cu for fair end-to-end comparison.
 constexpr int LDG_LM_NUM_BLOCKS = 1184;
 constexpr int LDG_LM_BLOCK_SIZE = 256;
 constexpr int LDG_VOCAB_SIZE = 151936;
@@ -67,8 +95,14 @@ struct LDGLayerWeights
 };
 
 // =============================================================================
-// Atomic barrier for persistent kernel (replaces cooperative grid.sync())
+// AtomicGridSync — replaces cooperative_groups::this_grid().sync()
 // =============================================================================
+//
+// Two atomic counters in global memory: ``counter`` tracks arrivals,
+// ``generation`` is bumped by the last arriver so spinning blocks can exit.
+// Each block stores its expected generation in ``local_gen``. Requires
+// ``__launch_bounds__(BLOCK_SIZE, 1)`` so only one block is co-resident per
+// SM (otherwise the spin-wait would deadlock against an unscheduled block).
 
 struct AtomicGridSync
 {
@@ -108,98 +142,117 @@ struct AtomicGridSync
 // Helpers
 // =============================================================================
 
-__device__ __forceinline__ float ldg_warp_reduce_sum(float val)
+__device__ __forceinline__ float warp_reduce_sum(float val)
 {
 #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
-    {
         val += __shfl_down_sync(0xffffffff, val, offset);
-    }
     return val;
 }
 
-__device__ __forceinline__ float ldg_silu(float x)
+__device__ __forceinline__ float silu(float x)
 {
     return x / (1.0f + expf(-x));
 }
 
-// Forward declaration for prefetch (defined in Phase 3)
+// =============================================================================
+// P7 idle-block L2 prefetch helper (PTX prefetch.global.L2::evict_last).
+// =============================================================================
+//
+// Each thread issues one ``prefetch.global.L2::evict_last`` per outer
+// iteration at 128-byte stride. Compared to P6's ``ld.global.nc.v4.b32`` body:
+//   - No register output, no asm sink needed (the hint is not a load).
+//   - Does not occupy an LDST instruction slot the way the streaming load
+//     does, so it does not contend with the attention block's real loads.
+//   - Does not pollute L1 — only L2 is touched, with ``evict_last`` policy so
+//     the line sits at the back of the LRU stack until it is consumed.
+// Stride / coverage / launch shape are identical to P6 (256 threads × 128B
+// per iter = 32 KB / iter = 256 cache lines, one prefetch per line).
+
 __device__ void ldg_prefetch_weights_l2(
-    const __nv_bfloat16 *__restrict__ weights, int num_elements);
+    const __nv_bfloat16 *__restrict__ weights, int num_elements)
+{
+    const char *base = reinterpret_cast<const char *>(weights);
+    int total_bytes = num_elements * 2; // bf16 = 2 bytes
+    for (int offset = threadIdx.x * 128; offset < total_bytes;
+         offset += LDG_BLOCK_SIZE * 128)
+    {
+        asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(base + offset));
+    }
+}
 
 // =============================================================================
-// Phase 1: RMSNorm + QKV Projection
+// Phase 1: RMSNorm (block 0) + QKV projection (all blocks)
 // =============================================================================
-
-__device__ void ldg_matvec_qkv(
+//
+// Block 0 computes the normalized vector and stores it in g_normalized (float,
+// global memory). A grid sync makes that result visible to every block, then
+// each block does its share of the [Q_SIZE+2*KV_SIZE] matvec.
+//
+__device__ void naive_rmsnorm_qkv(
     AtomicGridSync &grid,
     const __nv_bfloat16 *__restrict__ input,
     const __nv_bfloat16 *__restrict__ norm_weight,
     const __nv_bfloat16 *__restrict__ q_weight,
     const __nv_bfloat16 *__restrict__ k_weight,
     const __nv_bfloat16 *__restrict__ v_weight,
+    // P9 site-#1 prefetch targets (next phase's working set):
+    const __nv_bfloat16 *__restrict__ gate_weight,
+    const __nv_bfloat16 *__restrict__ up_weight,
     float *__restrict__ g_normalized,
     float *__restrict__ g_residual,
     float *__restrict__ q_out,
     float *__restrict__ k_out,
-    float *__restrict__ v_out,
-    const __nv_bfloat16 *__restrict__ gate_weight,
-    const __nv_bfloat16 *__restrict__ up_weight,
-    uint64_t *__restrict__ profiler_buffer,
-    bool prof_on)
+    float *__restrict__ v_out)
 {
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
 
-    // Redundant RMSNorm: every block computes its own copy in shared memory
-    // to avoid a grid.sync() between norm and QKV projection
-    __shared__ float s_normalized[SMEM_PAD_SIZE(HIDDEN_SIZE)];
+    // Distributed residual write – every block writes a slice of input -> float
+    {
+        int per_block = (HIDDEN_SIZE + num_blocks - 1) / num_blocks;
+        int s = block_id * per_block;
+        int e = min(s + per_block, HIDDEN_SIZE);
+        for (int i = s + threadIdx.x; i < e; i += LDG_BLOCK_SIZE)
+            g_residual[i] = __bfloat162float(__ldg(input + i));
+    }
+
+    // Block 0: RMSNorm reduction + broadcast into g_normalized
+    if (block_id == 0)
     {
         __shared__ float smem_reduce[LDG_NUM_WARPS];
-
         float local_sum_sq = 0.0f;
         for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE)
         {
             float v = __bfloat162float(__ldg(input + i));
-            s_normalized[SMEM_PAD_IDX(i)] = v;
             local_sum_sq += v * v;
         }
-
-        local_sum_sq = ldg_warp_reduce_sum(local_sum_sq);
+        local_sum_sq = warp_reduce_sum(local_sum_sq);
         if (lane_id == 0)
             smem_reduce[warp_id] = local_sum_sq;
         __syncthreads();
-
         if (warp_id == 0)
         {
             float sum = (lane_id < LDG_NUM_WARPS) ? smem_reduce[lane_id] : 0.0f;
-            sum = ldg_warp_reduce_sum(sum);
+            sum = warp_reduce_sum(sum);
             if (lane_id == 0)
                 smem_reduce[0] = rsqrtf(sum / float(HIDDEN_SIZE) + LDG_RMS_EPS);
         }
         __syncthreads();
-
         float rstd = smem_reduce[0];
         for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE)
         {
+            float v = __bfloat162float(__ldg(input + i));
             float w = __bfloat162float(__ldg(norm_weight + i));
-            s_normalized[SMEM_PAD_IDX(i)] = s_normalized[SMEM_PAD_IDX(i)] * rstd * w;
+            g_normalized[i] = v * rstd * w;
         }
-        __syncthreads();
     }
+    // NAIVE: full grid sync between norm and projection (P1 reverts this away)
+    grid.sync();
 
-    // Distributed residual write: each block writes its share
-    {
-        int res_per_block = (HIDDEN_SIZE + num_blocks - 1) / num_blocks;
-        int res_start = block_id * res_per_block;
-        int res_end = min(res_start + res_per_block, HIDDEN_SIZE);
-        for (int i = res_start + threadIdx.x; i < res_end; i += LDG_BLOCK_SIZE)
-            g_residual[i] = __bfloat162float(__ldg(input + i));
-    }
-
-    // QKV projection with vec4 __ldg (reads from shared memory, no grid.sync needed)
+    // QKV projection – every block does its slice of [Q_SIZE+2*KV_SIZE] rows.
     constexpr int TOTAL_ROWS = Q_SIZE + KV_SIZE + KV_SIZE;
     int rows_per_block = (TOTAL_ROWS + num_blocks - 1) / num_blocks;
     int row_start = block_id * rows_per_block;
@@ -208,49 +261,42 @@ __device__ void ldg_matvec_qkv(
     for (int m_base = row_start; m_base < row_end; m_base += LDG_NUM_WARPS)
     {
         int m = m_base + warp_id;
-        if (m < row_end)
+        if (m >= row_end)
+            continue;
+
+        const __nv_bfloat16 *weight_row;
+        float *output_ptr;
+        if (m < Q_SIZE)
         {
-            const __nv_bfloat16 *weight_row;
-            float *output_ptr;
-
-            if (m < Q_SIZE)
-            {
-                weight_row = q_weight + m * HIDDEN_SIZE;
-                output_ptr = q_out + m;
-            }
-            else if (m < Q_SIZE + KV_SIZE)
-            {
-                weight_row = k_weight + (m - Q_SIZE) * HIDDEN_SIZE;
-                output_ptr = k_out + (m - Q_SIZE);
-            }
-            else
-            {
-                weight_row = v_weight + (m - Q_SIZE - KV_SIZE) * HIDDEN_SIZE;
-                output_ptr = v_out + (m - Q_SIZE - KV_SIZE);
-            }
-
-            float sum = 0.0f;
-#pragma unroll 4
-            for (int k = lane_id * 8; k < HIDDEN_SIZE; k += WARP_SIZE * 8)
-            {
-                uint4 w_u4 = __ldg(reinterpret_cast<const uint4 *>(weight_row + k));
-                __nv_bfloat16 *w_ptr = reinterpret_cast<__nv_bfloat16 *>(&w_u4);
-                int pk = SMEM_PAD_IDX(k);
-                sum += __bfloat162float(w_ptr[0]) * s_normalized[pk + 0] +
-                       __bfloat162float(w_ptr[1]) * s_normalized[pk + 1] +
-                       __bfloat162float(w_ptr[2]) * s_normalized[pk + 2] +
-                       __bfloat162float(w_ptr[3]) * s_normalized[pk + 3] +
-                       __bfloat162float(w_ptr[4]) * s_normalized[pk + 4] +
-                       __bfloat162float(w_ptr[5]) * s_normalized[pk + 5] +
-                       __bfloat162float(w_ptr[6]) * s_normalized[pk + 6] +
-                       __bfloat162float(w_ptr[7]) * s_normalized[pk + 7];
-            }
-            sum = ldg_warp_reduce_sum(sum);
-            if (lane_id == 0)
-                *output_ptr = sum;
+            weight_row = q_weight + m * HIDDEN_SIZE;
+            output_ptr = q_out + m;
         }
+        else if (m < Q_SIZE + KV_SIZE)
+        {
+            weight_row = k_weight + (m - Q_SIZE) * HIDDEN_SIZE;
+            output_ptr = k_out + (m - Q_SIZE);
+        }
+        else
+        {
+            weight_row = v_weight + (m - Q_SIZE - KV_SIZE) * HIDDEN_SIZE;
+            output_ptr = v_out + (m - Q_SIZE - KV_SIZE);
+        }
+
+        // NAIVE: scalar bf16 loads from weight, no uint4 (P4 reverts this)
+        float sum = 0.0f;
+        for (int k = lane_id; k < HIDDEN_SIZE; k += WARP_SIZE)
+        {
+            float w = __bfloat162float(__ldg(weight_row + k));
+            sum += w * g_normalized[k];
+        }
+        sum = warp_reduce_sum(sum);
+        if (lane_id == 0)
+            *output_ptr = sum;
     }
-    // Prefetch gate+up weights during upcoming grid.sync wait
+
+    // P9 site #1: prefetch gate+up weights during the upcoming grid.sync wait.
+    // All blocks participate; the combined gate+up region is split evenly so
+    // each block touches ~12 MB / num_blocks bytes.
     {
         constexpr int gate_total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
         constexpr int up_total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
@@ -275,16 +321,19 @@ __device__ void ldg_matvec_qkv(
             }
         }
     }
-    sm_profiler_event_start(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
+
     grid.sync();
-    sm_profiler_event_end(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
 }
 
 // =============================================================================
-// Phase 2: QK Norm + RoPE + KV Cache Write
+// Phase 2: QK Norm + RoPE + KV Cache write
 // =============================================================================
-
-__device__ void ldg_qk_norm_rope_cache(
+//
+// 16 Q heads (one per Q head) + 8 KV heads. We use the first 16 blocks for Q
+// heads and let those same blocks pick up the 8 KV heads (block_id < 8 also
+// handles a KV head).
+//
+__device__ void naive_qk_norm_rope_cache(
     AtomicGridSync &grid,
     float *__restrict__ q,
     float *__restrict__ k,
@@ -297,12 +346,10 @@ __device__ void ldg_qk_norm_rope_cache(
     __nv_bfloat16 *__restrict__ v_cache,
     int position,
     int max_seq_len,
+    // P9 site-#2 prefetch target (o_proj weight for the upcoming O projection):
     const __nv_bfloat16 *__restrict__ o_weight,
     unsigned int *__restrict__ kv_flag,
-    unsigned int *__restrict__ attn_flag,
-    int layer_idx,
-    uint64_t *__restrict__ profiler_buffer,
-    bool prof_on)
+    int layer_idx)
 {
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
@@ -312,19 +359,19 @@ __device__ void ldg_qk_norm_rope_cache(
     const __nv_bfloat16 *cos_pos = cos_table + position * HEAD_DIM;
     const __nv_bfloat16 *sin_pos = sin_table + position * HEAD_DIM;
 
-    // Q heads
-    int q_heads_per_block = (NUM_Q_HEADS + num_blocks - 1) / num_blocks;
-    int q_head_start = block_id * q_heads_per_block;
-    int q_head_end = min(q_head_start + q_heads_per_block, NUM_Q_HEADS);
+    // Q heads – distribute NUM_Q_HEADS across all blocks
+    int q_per_block = (NUM_Q_HEADS + num_blocks - 1) / num_blocks;
+    int q_start = block_id * q_per_block;
+    int q_end = min(q_start + q_per_block, NUM_Q_HEADS);
 
-    for (int h = q_head_start + warp_id; h < q_head_end; h += LDG_NUM_WARPS)
+    for (int h = q_start + warp_id; h < q_end; h += LDG_NUM_WARPS)
     {
         float *q_head = q + h * HEAD_DIM;
 
         float sum_sq = 0.0f;
         for (int i = lane_id; i < HEAD_DIM; i += WARP_SIZE)
             sum_sq += q_head[i] * q_head[i];
-        sum_sq = ldg_warp_reduce_sum(sum_sq);
+        sum_sq = warp_reduce_sum(sum_sq);
         float scale = rsqrtf(sum_sq / float(HEAD_DIM) + LDG_RMS_EPS);
         scale = __shfl_sync(0xffffffff, scale, 0);
 
@@ -349,12 +396,12 @@ __device__ void ldg_qk_norm_rope_cache(
         }
     }
 
-    // K heads + cache write
-    int k_heads_per_block = (NUM_KV_HEADS + num_blocks - 1) / num_blocks;
-    int k_head_start = block_id * k_heads_per_block;
-    int k_head_end = min(k_head_start + k_heads_per_block, NUM_KV_HEADS);
+    // K + V heads – distribute NUM_KV_HEADS across all blocks
+    int k_per_block = (NUM_KV_HEADS + num_blocks - 1) / num_blocks;
+    int k_start = block_id * k_per_block;
+    int k_end = min(k_start + k_per_block, NUM_KV_HEADS);
 
-    for (int h = k_head_start + warp_id; h < k_head_end; h += LDG_NUM_WARPS)
+    for (int h = k_start + warp_id; h < k_end; h += LDG_NUM_WARPS)
     {
         float *k_head = k + h * HEAD_DIM;
         const float *v_head = v + h * HEAD_DIM;
@@ -364,7 +411,7 @@ __device__ void ldg_qk_norm_rope_cache(
         float sum_sq = 0.0f;
         for (int i = lane_id; i < HEAD_DIM; i += WARP_SIZE)
             sum_sq += k_head[i] * k_head[i];
-        sum_sq = ldg_warp_reduce_sum(sum_sq);
+        sum_sq = warp_reduce_sum(sum_sq);
         float scale = rsqrtf(sum_sq / float(HEAD_DIM) + LDG_RMS_EPS);
         scale = __shfl_sync(0xffffffff, scale, 0);
 
@@ -393,26 +440,30 @@ __device__ void ldg_qk_norm_rope_cache(
             v_cache_head[i] = __float2bfloat16(v_head[i]);
         }
     }
-    // Prefetch O weight during idle DRAM window
+
+    // P9 site #2: prefetch o_proj weight while we wait for kv_flag. All blocks
+    // (including non-attention blocks 16..19) split the 4 MB o_weight evenly.
     {
         constexpr int o_total = Q_SIZE * HIDDEN_SIZE;
         int elems_per_block = (o_total + num_blocks - 1) / num_blocks;
         int my_offset = block_id * elems_per_block;
         if (my_offset < o_total)
-            ldg_prefetch_weights_l2(o_weight + my_offset, min(elems_per_block, o_total - my_offset));
+            ldg_prefetch_weights_l2(o_weight + my_offset,
+                                    min(elems_per_block, o_total - my_offset));
     }
-    // kv_flag partial barrier: attention blocks (0..ATTN_BLOCKS-1) synchronize
-    // using a monotonic atomic counter so all Q/K/V writes are visible before attention
-    sm_profiler_event_start(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
+
+    // P3 partial barrier: only the 16 attention blocks need to see all Q / K / V
+    // writes. Blocks >= ATTN_BLOCKS (16..19) skip this barrier and wait on
+    // attn_flag inside the attention phase instead. kv_flag is monotonic across
+    // layers (target = ATTN_BLOCKS * (layer_idx + 1)).
     const int ATTN_BLOCKS = NUM_Q_HEADS; // 16
     if (block_id < ATTN_BLOCKS)
     {
-        __syncthreads(); // finish QK norm + cache writes within block
+        __syncthreads();
         if (threadIdx.x == 0)
         {
             asm volatile("fence.acq_rel.gpu;" ::: "memory");
             atomicAdd(kv_flag, 1);
-            // Wait for all attention blocks to have completed their writes
             unsigned int target = (unsigned int)(ATTN_BLOCKS * (layer_idx + 1));
             volatile unsigned int *vf = (volatile unsigned int *)kv_flag;
             while (*vf < target)
@@ -422,31 +473,16 @@ __device__ void ldg_qk_norm_rope_cache(
         }
         __syncthreads();
     }
-    // Blocks >= ATTN_BLOCKS: skip entirely (they don't do attention)
-    sm_profiler_event_end(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
 }
 
 // =============================================================================
-// Phase 3: Flash-decoding Attention (+ L2 weight prefetch by idle blocks)
+// Phase 3: Flash-decoding attention
 // =============================================================================
-
-__device__ void ldg_prefetch_weights_l2(
-    const __nv_bfloat16 *__restrict__ weights, int num_elements)
-{
-    // Use PTX prefetch.global.L2::evict_last to hint L2 to keep data persistent.
-    // Each prefetch touches one cache line (128 bytes = 64 bf16 elements).
-    // 256 threads × 128 bytes = 32 KB per iteration = 256 cache lines.
-    // Stride: LDG_BLOCK_SIZE cache lines = 256 * 128 bytes = 32768 bytes per step.
-
-    const char *base = reinterpret_cast<const char *>(weights);
-    int total_bytes = num_elements * 2; // bf16 = 2 bytes
-    for (int offset = threadIdx.x * 128; offset < total_bytes; offset += LDG_BLOCK_SIZE * 128)
-    {
-        asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(base + offset));
-    }
-}
-
-__device__ void ldg_attention(
+//
+// 16 attention blocks (one per Q head). Remaining blocks idle through this
+// phase – naive does nothing useful with them (no prefetch).
+//
+__device__ void naive_attention(
     AtomicGridSync &grid,
     const float *__restrict__ q,
     const __nv_bfloat16 *__restrict__ k_cache,
@@ -455,95 +491,28 @@ __device__ void ldg_attention(
     int cache_len,
     int max_seq_len,
     float attn_scale,
+    // P6: idle-block prefetch needs the post-attn weight pointers
     const __nv_bfloat16 *__restrict__ o_weight,
     const __nv_bfloat16 *__restrict__ gate_weight,
     const __nv_bfloat16 *__restrict__ up_weight,
     const __nv_bfloat16 *__restrict__ down_weight,
     unsigned int *__restrict__ attn_flag,
-    int layer_idx,
-    uint64_t *__restrict__ profiler_buffer,
-    bool prof_on)
+    int layer_idx)
 {
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
 
-    const int ATTN_BLOCKS = NUM_Q_HEADS;
+    const int ATTN_BLOCKS = NUM_Q_HEADS; // 16
 
-    // Idle blocks prefetch current layer's o_proj, gate, up, down weights into L2
-    if (block_id >= ATTN_BLOCKS)
+    if (block_id < ATTN_BLOCKS)
     {
-        sm_profiler_event_start(profiler_buffer, SM_PROF_ATTN_PREFETCH, prof_on);
-        int prefetch_block_id = block_id - ATTN_BLOCKS;
-        int num_prefetch_blocks = num_blocks - ATTN_BLOCKS;
-        // Split idle blocks into 4 groups: O, gate, up, down
-        constexpr int num_groups = 4;
-        int group = prefetch_block_id * num_groups / num_prefetch_blocks;
-        int grp_start = group * num_prefetch_blocks / num_groups;
-        int adj = prefetch_block_id - grp_start;
-        int grp_count = ((group + 1) * num_prefetch_blocks / num_groups) - grp_start;
-        if (group == 0)
-        {
-            int total = Q_SIZE * HIDDEN_SIZE;
-            int elems = total / grp_count;
-            int offset = adj * elems;
-            if (offset < total)
-                ldg_prefetch_weights_l2(o_weight + offset, min(elems, total - offset));
-        }
-        else if (group == 1)
-        {
-            int total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
-            int elems = total / grp_count;
-            int offset = adj * elems;
-            if (offset < total)
-                ldg_prefetch_weights_l2(gate_weight + offset, min(elems, total - offset));
-        }
-        else if (group == 2)
-        {
-            int total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
-            int elems = total / grp_count;
-            int offset = adj * elems;
-            if (offset < total)
-                ldg_prefetch_weights_l2(up_weight + offset, min(elems, total - offset));
-        }
-        else
-        {
-            int total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
-            int elems = total / grp_count;
-            int offset = adj * elems;
-            if (offset < total)
-                ldg_prefetch_weights_l2(down_weight + offset, min(elems, total - offset));
-        }
-        sm_profiler_event_end(profiler_buffer, SM_PROF_ATTN_PREFETCH, prof_on);
-        // Non-attention blocks: wait for attention completion via attn_flag
-        sm_profiler_event_start(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
-        if (threadIdx.x == 0)
-        {
-            unsigned int target = (unsigned int)(ATTN_BLOCKS * (layer_idx + 1));
-            volatile unsigned int *vf = (volatile unsigned int *)attn_flag;
-            while (*vf < target)
-            {
-            }
-            asm volatile("fence.acq_rel.gpu;" ::: "memory");
-        }
-        __syncthreads();
-        sm_profiler_event_end(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
-        return;
-    }
+        __shared__ float s_max_score[LDG_NUM_WARPS];
+        __shared__ float s_sum_exp[LDG_NUM_WARPS];
+        __shared__ float s_out_acc[LDG_NUM_WARPS][HEAD_DIM];
 
-    sm_profiler_event_start(profiler_buffer, SM_PROF_ATTN_COMPUTE, prof_on);
-
-    __shared__ float s_max_score[LDG_NUM_WARPS];
-    __shared__ float s_sum_exp[LDG_NUM_WARPS];
-    __shared__ float s_out_acc[LDG_NUM_WARPS][HEAD_DIM];
-
-    int heads_per_block = (NUM_Q_HEADS + ATTN_BLOCKS - 1) / ATTN_BLOCKS;
-    int head_start = block_id * heads_per_block;
-    int head_end = min(head_start + heads_per_block, NUM_Q_HEADS);
-
-    for (int qh = head_start; qh < head_end; qh++)
-    {
+        int qh = block_id; // one Q head per block
         int kv_head = qh / (NUM_Q_HEADS / NUM_KV_HEADS);
         const float *q_head = q + qh * HEAD_DIM;
         float *out_head = attn_out + qh * HEAD_DIM;
@@ -552,28 +521,23 @@ __device__ void ldg_attention(
         float sum_exp = 0.0f;
         float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-        // Cache Q head in registers using contiguous vec4 pattern
         int q_idx = lane_id * 4;
-        float q_local[4];
-        q_local[0] = q_head[q_idx + 0];
-        q_local[1] = q_head[q_idx + 1];
-        q_local[2] = q_head[q_idx + 2];
-        q_local[3] = q_head[q_idx + 3];
 
         for (int pos = warp_id; pos < cache_len; pos += LDG_NUM_WARPS)
         {
-            const __nv_bfloat16 *k_pos = k_cache + kv_head * max_seq_len * HEAD_DIM + pos * HEAD_DIM;
-            const __nv_bfloat16 *v_pos = v_cache + kv_head * max_seq_len * HEAD_DIM + pos * HEAD_DIM;
+            const __nv_bfloat16 *k_pos =
+                k_cache + kv_head * max_seq_len * HEAD_DIM + pos * HEAD_DIM;
+            const __nv_bfloat16 *v_pos =
+                v_cache + kv_head * max_seq_len * HEAD_DIM + pos * HEAD_DIM;
 
-            // Vectorized uint2 load for K cache
+            // NAIVE: scalar bf16 loads from KV cache (P4 reverts this)
+            // NAIVE: Q read from global per iter, no register cache (P4 reverts this)
             float score = 0.0f;
-            uint2 k_u2 = __ldg(reinterpret_cast<const uint2 *>(k_pos + q_idx));
-            __nv_bfloat16 *k_ptr = reinterpret_cast<__nv_bfloat16 *>(&k_u2);
-            score += q_local[0] * __bfloat162float(k_ptr[0]) +
-                     q_local[1] * __bfloat162float(k_ptr[1]) +
-                     q_local[2] * __bfloat162float(k_ptr[2]) +
-                     q_local[3] * __bfloat162float(k_ptr[3]);
-            score = ldg_warp_reduce_sum(score) * attn_scale;
+            score += q_head[q_idx + 0] * __bfloat162float(__ldg(k_pos + q_idx + 0));
+            score += q_head[q_idx + 1] * __bfloat162float(__ldg(k_pos + q_idx + 1));
+            score += q_head[q_idx + 2] * __bfloat162float(__ldg(k_pos + q_idx + 2));
+            score += q_head[q_idx + 3] * __bfloat162float(__ldg(k_pos + q_idx + 3));
+            score = warp_reduce_sum(score) * attn_scale;
             score = __shfl_sync(0xffffffff, score, 0);
 
             float old_max = max_score;
@@ -582,13 +546,14 @@ __device__ void ldg_attention(
             sum_exp = sum_exp * exp_diff + expf(score - max_score);
             float weight = expf(score - max_score);
 
-            // Vectorized uint2 load for V cache
-            uint2 v_u2 = __ldg(reinterpret_cast<const uint2 *>(v_pos + q_idx));
-            __nv_bfloat16 *v_ptr = reinterpret_cast<__nv_bfloat16 *>(&v_u2);
-            out_acc[0] = out_acc[0] * exp_diff + weight * __bfloat162float(v_ptr[0]);
-            out_acc[1] = out_acc[1] * exp_diff + weight * __bfloat162float(v_ptr[1]);
-            out_acc[2] = out_acc[2] * exp_diff + weight * __bfloat162float(v_ptr[2]);
-            out_acc[3] = out_acc[3] * exp_diff + weight * __bfloat162float(v_ptr[3]);
+            float v0 = __bfloat162float(__ldg(v_pos + q_idx + 0));
+            float v1 = __bfloat162float(__ldg(v_pos + q_idx + 1));
+            float v2 = __bfloat162float(__ldg(v_pos + q_idx + 2));
+            float v3 = __bfloat162float(__ldg(v_pos + q_idx + 3));
+            out_acc[0] = out_acc[0] * exp_diff + weight * v0;
+            out_acc[1] = out_acc[1] * exp_diff + weight * v1;
+            out_acc[2] = out_acc[2] * exp_diff + weight * v2;
+            out_acc[3] = out_acc[3] * exp_diff + weight * v3;
         }
 
         if (lane_id == 0)
@@ -603,7 +568,6 @@ __device__ void ldg_attention(
         s_out_acc[warp_id][out_base + 3] = out_acc[3];
         __syncthreads();
 
-        // Warp 0 combines partial results
         if (warp_id == 0)
         {
             float global_max = s_max_score[0];
@@ -634,13 +598,63 @@ __device__ void ldg_attention(
         }
         __syncthreads();
     }
-    sm_profiler_event_end(profiler_buffer, SM_PROF_ATTN_COMPUTE, prof_on);
-    // Attention blocks signal completion via attn_flag
-    sm_profiler_event_start(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
-    asm volatile("fence.acq_rel.gpu;" ::: "memory");
-    if (threadIdx.x == 0)
-        atomicAdd(attn_flag, 1);
-    // Attention blocks also wait for all attention to complete before proceeding
+    else
+    {
+        // P6 idle-block L2 prefetch: split the 4 non-attention blocks into 4
+        // groups (one per post-attn weight matrix) and have each block stream-
+        // load its slice into L2 via PTX prefetch.global.L2::evict_last.
+        int prefetch_block_id = block_id - ATTN_BLOCKS;
+        int num_prefetch_blocks = num_blocks - ATTN_BLOCKS;
+        if (num_prefetch_blocks > 0)
+        {
+            constexpr int num_groups = 4;
+            int group = prefetch_block_id * num_groups / num_prefetch_blocks;
+            int grp_start = group * num_prefetch_blocks / num_groups;
+            int adj = prefetch_block_id - grp_start;
+            int grp_count = ((group + 1) * num_prefetch_blocks / num_groups) - grp_start;
+            if (group == 0)
+            {
+                int total = Q_SIZE * HIDDEN_SIZE;
+                int elems = total / grp_count;
+                int offset = adj * elems;
+                if (offset < total)
+                    ldg_prefetch_weights_l2(o_weight + offset, min(elems, total - offset));
+            }
+            else if (group == 1)
+            {
+                int total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
+                int elems = total / grp_count;
+                int offset = adj * elems;
+                if (offset < total)
+                    ldg_prefetch_weights_l2(gate_weight + offset, min(elems, total - offset));
+            }
+            else if (group == 2)
+            {
+                int total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
+                int elems = total / grp_count;
+                int offset = adj * elems;
+                if (offset < total)
+                    ldg_prefetch_weights_l2(up_weight + offset, min(elems, total - offset));
+            }
+            else
+            {
+                int total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
+                int elems = total / grp_count;
+                int offset = adj * elems;
+                if (offset < total)
+                    ldg_prefetch_weights_l2(down_weight + offset, min(elems, total - offset));
+            }
+        }
+    }
+    // P3 partial barrier on attn_flag. Attention blocks signal completion then
+    // spin; non-attention blocks (16..19) skip the work but spin on the same
+    // flag so they don't run ahead of o_proj inputs.
+    if (block_id < ATTN_BLOCKS)
+    {
+        asm volatile("fence.acq_rel.gpu;" ::: "memory");
+        if (threadIdx.x == 0)
+            atomicAdd(attn_flag, 1);
+    }
     if (threadIdx.x == 0)
     {
         unsigned int target = (unsigned int)(ATTN_BLOCKS * (layer_idx + 1));
@@ -651,44 +665,37 @@ __device__ void ldg_attention(
         asm volatile("fence.acq_rel.gpu;" ::: "memory");
     }
     __syncthreads();
-    sm_profiler_event_end(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
 }
 
 // =============================================================================
-// Phase 4: O Projection + Post-Norm + MLP
+// Phase 4: O proj + residual + post-norm + gate/up + down + residual
 // =============================================================================
 
-__device__ void ldg_o_proj_postnorm_mlp(
+__device__ void naive_o_proj_postnorm_mlp(
     AtomicGridSync &grid,
     const __nv_bfloat16 *__restrict__ o_weight,
     const __nv_bfloat16 *__restrict__ post_norm_weight,
     const __nv_bfloat16 *__restrict__ gate_weight,
     const __nv_bfloat16 *__restrict__ up_weight,
     const __nv_bfloat16 *__restrict__ down_weight,
-    const float *__restrict__ attn_out,
-    float *__restrict__ g_residual,
-    float *__restrict__ g_activations,
-    float *__restrict__ g_mlp_intermediate,
-    __nv_bfloat16 *__restrict__ hidden_out,
+    // P9 site-#4 prefetch targets (next layer's QKV; nullable on last layer):
     const __nv_bfloat16 *__restrict__ next_q_weight,
     const __nv_bfloat16 *__restrict__ next_k_weight,
     const __nv_bfloat16 *__restrict__ next_v_weight,
     bool is_last_layer,
-    uint64_t *__restrict__ profiler_buffer,
-    bool prof_on)
+    const float *__restrict__ attn_out,
+    float *__restrict__ g_residual,
+    float *__restrict__ g_activations,
+    float *__restrict__ g_mlp_intermediate,
+    float *__restrict__ g_normalized,
+    __nv_bfloat16 *__restrict__ hidden_out)
 {
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
 
-    // Cache attn_out in shared memory to avoid repeated global reads
-    __shared__ float s_attn[SMEM_PAD_SIZE(Q_SIZE)];
-    for (int i = threadIdx.x; i < Q_SIZE; i += LDG_BLOCK_SIZE)
-        s_attn[SMEM_PAD_IDX(i)] = attn_out[i];
-    __syncthreads();
-
-    // O projection + residual
+    // O projection + residual add
     int hid_per_block = (HIDDEN_SIZE + num_blocks - 1) / num_blocks;
     int hid_start = block_id * hid_per_block;
     int hid_end = min(hid_start + hid_per_block, HIDDEN_SIZE);
@@ -696,62 +703,51 @@ __device__ void ldg_o_proj_postnorm_mlp(
     for (int m_base = hid_start; m_base < hid_end; m_base += LDG_NUM_WARPS)
     {
         int m = m_base + warp_id;
-        if (m < hid_end)
+        if (m >= hid_end)
+            continue;
+        const __nv_bfloat16 *o_row = o_weight + m * Q_SIZE;
+        // NAIVE: scalar bf16 weight load, attn_out read from global
+        float sum = 0.0f;
+        for (int k = lane_id; k < Q_SIZE; k += WARP_SIZE)
         {
-            const __nv_bfloat16 *o_row = o_weight + m * Q_SIZE;
-            float sum = 0.0f;
-#pragma unroll 4
-            for (int k = lane_id * 8; k < Q_SIZE; k += WARP_SIZE * 8)
-            {
-                uint4 w_u4 = __ldg(reinterpret_cast<const uint4 *>(o_row + k));
-                __nv_bfloat16 *w_ptr = reinterpret_cast<__nv_bfloat16 *>(&w_u4);
-                int pk = SMEM_PAD_IDX(k);
-                sum += __bfloat162float(w_ptr[0]) * s_attn[pk + 0] +
-                       __bfloat162float(w_ptr[1]) * s_attn[pk + 1] +
-                       __bfloat162float(w_ptr[2]) * s_attn[pk + 2] +
-                       __bfloat162float(w_ptr[3]) * s_attn[pk + 3] +
-                       __bfloat162float(w_ptr[4]) * s_attn[pk + 4] +
-                       __bfloat162float(w_ptr[5]) * s_attn[pk + 5] +
-                       __bfloat162float(w_ptr[6]) * s_attn[pk + 6] +
-                       __bfloat162float(w_ptr[7]) * s_attn[pk + 7];
-            }
-            sum = ldg_warp_reduce_sum(sum);
-            if (lane_id == 0)
-                g_activations[m] = sum + g_residual[m];
+            float w = __bfloat162float(__ldg(o_row + k));
+            sum += w * attn_out[k];
         }
+        sum = warp_reduce_sum(sum);
+        if (lane_id == 0)
+            g_activations[m] = sum + g_residual[m];
     }
-    // Prefetch down weight during upcoming O proj grid.sync wait
+
+    // P9 site #3: prefetch down weight (6 MB) before the post-O-proj grid.sync.
     {
         constexpr int down_total = HIDDEN_SIZE * INTERMEDIATE_SIZE;
         int elems_per_block = (down_total + num_blocks - 1) / num_blocks;
         int my_offset = block_id * elems_per_block;
         if (my_offset < down_total)
-            ldg_prefetch_weights_l2(down_weight + my_offset, min(elems_per_block, down_total - my_offset));
+            ldg_prefetch_weights_l2(down_weight + my_offset,
+                                    min(elems_per_block, down_total - my_offset));
     }
-    sm_profiler_event_start(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
-    grid.sync();
-    sm_profiler_event_end(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
 
-    // Post-attention RMSNorm: redundant across all blocks into shared memory
-    // Eliminates grid.sync between norm and gate/up projection
-    __shared__ float s_post_normalized[SMEM_PAD_SIZE(HIDDEN_SIZE)];
+    grid.sync();
+
+    // Post-attention RMSNorm – block 0 produces g_normalized in float (P1 reverted)
+    if (block_id == 0)
     {
         __shared__ float smem_reduce[LDG_NUM_WARPS];
         float local_sum_sq = 0.0f;
         for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE)
         {
             float v = g_activations[i];
-            s_post_normalized[SMEM_PAD_IDX(i)] = v;
             local_sum_sq += v * v;
         }
-        local_sum_sq = ldg_warp_reduce_sum(local_sum_sq);
+        local_sum_sq = warp_reduce_sum(local_sum_sq);
         if (lane_id == 0)
             smem_reduce[warp_id] = local_sum_sq;
         __syncthreads();
         if (warp_id == 0)
         {
             float sum = (lane_id < LDG_NUM_WARPS) ? smem_reduce[lane_id] : 0.0f;
-            sum = ldg_warp_reduce_sum(sum);
+            sum = warp_reduce_sum(sum);
             if (lane_id == 0)
                 smem_reduce[0] = rsqrtf(sum / float(HIDDEN_SIZE) + LDG_RMS_EPS);
         }
@@ -760,21 +756,22 @@ __device__ void ldg_o_proj_postnorm_mlp(
         for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE)
         {
             float w = __bfloat162float(__ldg(post_norm_weight + i));
-            s_post_normalized[SMEM_PAD_IDX(i)] = s_post_normalized[SMEM_PAD_IDX(i)] * rstd * w;
+            g_normalized[i] = g_activations[i] * rstd * w;
         }
-        __syncthreads();
     }
 
-    // Distributed residual update: each block writes its share of g_residual
+    // Distributed residual update – the pre-MLP activations become the new residual
     {
-        int res_per_block = (HIDDEN_SIZE + num_blocks - 1) / num_blocks;
-        int res_start = block_id * res_per_block;
-        int res_end = min(res_start + res_per_block, HIDDEN_SIZE);
-        for (int i = res_start + threadIdx.x; i < res_end; i += LDG_BLOCK_SIZE)
+        int per_block = (HIDDEN_SIZE + num_blocks - 1) / num_blocks;
+        int s = block_id * per_block;
+        int e = min(s + per_block, HIDDEN_SIZE);
+        for (int i = s + threadIdx.x; i < e; i += LDG_BLOCK_SIZE)
             g_residual[i] = g_activations[i];
     }
 
-    // Gate + Up + SiLU: all blocks participate
+    grid.sync();
+
+    // Gate + Up + SiLU – read g_normalized from global
     {
         int int_per_block = (INTERMEDIATE_SIZE + num_blocks - 1) / num_blocks;
         int int_start = block_id * int_per_block;
@@ -783,87 +780,50 @@ __device__ void ldg_o_proj_postnorm_mlp(
         for (int m_base = int_start; m_base < int_end; m_base += LDG_NUM_WARPS)
         {
             int m = m_base + warp_id;
-            if (m < int_end)
+            if (m >= int_end)
+                continue;
+            const __nv_bfloat16 *gate_row = gate_weight + m * HIDDEN_SIZE;
+            const __nv_bfloat16 *up_row = up_weight + m * HIDDEN_SIZE;
+            float gate_sum = 0.0f, up_sum = 0.0f;
+            for (int k = lane_id; k < HIDDEN_SIZE; k += WARP_SIZE)
             {
-                const __nv_bfloat16 *gate_row = gate_weight + m * HIDDEN_SIZE;
-                const __nv_bfloat16 *up_row = up_weight + m * HIDDEN_SIZE;
-
-                float gate_sum = 0.0f, up_sum = 0.0f;
-#pragma unroll 4
-                for (int k = lane_id * 8; k < HIDDEN_SIZE; k += WARP_SIZE * 8)
-                {
-                    uint4 g_u4 = __ldg(reinterpret_cast<const uint4 *>(gate_row + k));
-                    uint4 u_u4 = __ldg(reinterpret_cast<const uint4 *>(up_row + k));
-                    __nv_bfloat16 *g_ptr = reinterpret_cast<__nv_bfloat16 *>(&g_u4);
-                    __nv_bfloat16 *u_ptr = reinterpret_cast<__nv_bfloat16 *>(&u_u4);
-                    int pk = SMEM_PAD_IDX(k);
-                    float s0 = s_post_normalized[pk + 0], s1 = s_post_normalized[pk + 1],
-                          s2 = s_post_normalized[pk + 2], s3 = s_post_normalized[pk + 3],
-                          s4 = s_post_normalized[pk + 4], s5 = s_post_normalized[pk + 5],
-                          s6 = s_post_normalized[pk + 6], s7 = s_post_normalized[pk + 7];
-                    gate_sum += __bfloat162float(g_ptr[0]) * s0 +
-                                __bfloat162float(g_ptr[1]) * s1 +
-                                __bfloat162float(g_ptr[2]) * s2 +
-                                __bfloat162float(g_ptr[3]) * s3 +
-                                __bfloat162float(g_ptr[4]) * s4 +
-                                __bfloat162float(g_ptr[5]) * s5 +
-                                __bfloat162float(g_ptr[6]) * s6 +
-                                __bfloat162float(g_ptr[7]) * s7;
-                    up_sum += __bfloat162float(u_ptr[0]) * s0 +
-                              __bfloat162float(u_ptr[1]) * s1 +
-                              __bfloat162float(u_ptr[2]) * s2 +
-                              __bfloat162float(u_ptr[3]) * s3 +
-                              __bfloat162float(u_ptr[4]) * s4 +
-                              __bfloat162float(u_ptr[5]) * s5 +
-                              __bfloat162float(u_ptr[6]) * s6 +
-                              __bfloat162float(u_ptr[7]) * s7;
-                }
-                gate_sum = ldg_warp_reduce_sum(gate_sum);
-                up_sum = ldg_warp_reduce_sum(up_sum);
-                if (lane_id == 0)
-                    g_mlp_intermediate[m] = ldg_silu(gate_sum) * up_sum;
+                float gw = __bfloat162float(__ldg(gate_row + k));
+                float uw = __bfloat162float(__ldg(up_row + k));
+                float x = g_normalized[k];
+                gate_sum += gw * x;
+                up_sum += uw * x;
             }
+            gate_sum = warp_reduce_sum(gate_sum);
+            up_sum = warp_reduce_sum(up_sum);
+            if (lane_id == 0)
+                g_mlp_intermediate[m] = silu(gate_sum) * up_sum;
         }
     }
-    sm_profiler_event_start(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
-    grid.sync();
-    sm_profiler_event_end(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
 
-    // Cache mlp_intermediate in shared memory for down projection
-    __shared__ float s_mlp[SMEM_PAD_SIZE(INTERMEDIATE_SIZE)];
-    for (int i = threadIdx.x; i < INTERMEDIATE_SIZE; i += LDG_BLOCK_SIZE)
-        s_mlp[SMEM_PAD_IDX(i)] = g_mlp_intermediate[i];
-    __syncthreads();
+    grid.sync();
 
     // Down projection + residual
     for (int m_base = hid_start; m_base < hid_end; m_base += LDG_NUM_WARPS)
     {
         int m = m_base + warp_id;
-        if (m < hid_end)
+        if (m >= hid_end)
+            continue;
+        const __nv_bfloat16 *down_row = down_weight + m * INTERMEDIATE_SIZE;
+        // NAIVE: scalar bf16 weight load, read mlp_intermediate from global
+        float sum = 0.0f;
+        for (int k = lane_id; k < INTERMEDIATE_SIZE; k += WARP_SIZE)
         {
-            const __nv_bfloat16 *down_row = down_weight + m * INTERMEDIATE_SIZE;
-            float sum = 0.0f;
-#pragma unroll 4
-            for (int k = lane_id * 8; k < INTERMEDIATE_SIZE; k += WARP_SIZE * 8)
-            {
-                uint4 d_u4 = __ldg(reinterpret_cast<const uint4 *>(down_row + k));
-                __nv_bfloat16 *d_ptr = reinterpret_cast<__nv_bfloat16 *>(&d_u4);
-                int pk = SMEM_PAD_IDX(k);
-                sum += __bfloat162float(d_ptr[0]) * s_mlp[pk + 0] +
-                       __bfloat162float(d_ptr[1]) * s_mlp[pk + 1] +
-                       __bfloat162float(d_ptr[2]) * s_mlp[pk + 2] +
-                       __bfloat162float(d_ptr[3]) * s_mlp[pk + 3] +
-                       __bfloat162float(d_ptr[4]) * s_mlp[pk + 4] +
-                       __bfloat162float(d_ptr[5]) * s_mlp[pk + 5] +
-                       __bfloat162float(d_ptr[6]) * s_mlp[pk + 6] +
-                       __bfloat162float(d_ptr[7]) * s_mlp[pk + 7];
-            }
-            sum = ldg_warp_reduce_sum(sum);
-            if (lane_id == 0)
-                hidden_out[m] = __float2bfloat16(sum + g_residual[m]);
+            float w = __bfloat162float(__ldg(down_row + k));
+            sum += w * g_mlp_intermediate[k];
         }
+        sum = warp_reduce_sum(sum);
+        if (lane_id == 0)
+            hidden_out[m] = __float2bfloat16(sum + g_residual[m]);
     }
-    // Prefetch next layer QKV during upcoming down proj grid.sync wait
+
+    // P10 site #4 (post-Down placement, relocated from P9's post-GU): prefetch
+    // next layer's Q/K/V weights (8 MB combined) while we wait for the final
+    // end-of-layer grid.sync. Skipped on the last layer.
     if (!is_last_layer)
     {
         constexpr int q_total = Q_SIZE * HIDDEN_SIZE;
@@ -897,13 +857,12 @@ __device__ void ldg_o_proj_postnorm_mlp(
             }
         }
     }
-    sm_profiler_event_start(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
+
     grid.sync();
-    sm_profiler_event_end(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
 }
 
 // =============================================================================
-// Main persistent decode kernel (all layers fused)
+// Main persistent decode kernel (all layers fused, cooperative launch)
 // =============================================================================
 
 __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1)
@@ -930,7 +889,6 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1)
         int cache_len,
         int max_seq_len,
         float attn_scale,
-        uint64_t *__restrict__ profiler_buffer,
         unsigned int *__restrict__ barrier_counter,
         unsigned int *__restrict__ barrier_sense,
         unsigned int *__restrict__ kv_flag,
@@ -939,9 +897,9 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1)
     int block_id = blockIdx.x;
     int num_blocks = gridDim.x;
 
-    bool prof_on = (profiler_buffer != nullptr);
-
-    // Bootstrap: reset flags and synchronize all blocks via atomics
+    // Bootstrap: block 0 resets kv_flag and attn_flag, then every block joins
+    // a single arrival barrier driven by barrier_counter / barrier_sense before
+    // constructing the AtomicGridSync view.
     if (block_id == 0 && threadIdx.x == 0)
     {
         atomicExch(kv_flag, 0u);
@@ -969,67 +927,62 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1)
     __syncthreads();
     AtomicGridSync grid{barrier_counter, barrier_sense, (unsigned int)gridDim.x, 1};
 
-    // Embedding lookup
-    sm_profiler_event_start(profiler_buffer, SM_PROF_EMBEDDING, prof_on);
-    const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
-    for (int i = block_id * LDG_BLOCK_SIZE + threadIdx.x; i < HIDDEN_SIZE; i += num_blocks * LDG_BLOCK_SIZE)
-        hidden_buffer[i] = __ldg(embed_row + i);
-    sm_profiler_event_end(profiler_buffer, SM_PROF_EMBEDDING, prof_on);
-    sm_profiler_event_start(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
+    // Embedding lookup – distributed across blocks
+    {
+        const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
+        for (int i = block_id * LDG_BLOCK_SIZE + threadIdx.x;
+             i < HIDDEN_SIZE;
+             i += num_blocks * LDG_BLOCK_SIZE)
+        {
+            hidden_buffer[i] = __ldg(embed_row + i);
+        }
+    }
     grid.sync();
-    sm_profiler_event_end(profiler_buffer, SM_PROF_GRID_SYNC, prof_on);
 
-    int kv_cache_layer_stride = NUM_KV_HEADS * max_seq_len * HEAD_DIM;
+    int kv_layer_stride = NUM_KV_HEADS * max_seq_len * HEAD_DIM;
 
     for (int layer = 0; layer < num_layers; layer++)
     {
         const LDGLayerWeights &w = layer_weights[layer];
-        __nv_bfloat16 *layer_k = k_cache + layer * kv_cache_layer_stride;
-        __nv_bfloat16 *layer_v = v_cache + layer * kv_cache_layer_stride;
-
-        sm_profiler_event_start(profiler_buffer, SM_PROF_QKV_PROJ, prof_on);
-        ldg_matvec_qkv(grid, hidden_buffer, w.input_layernorm_weight,
-                       w.q_proj_weight, w.k_proj_weight, w.v_proj_weight,
-                       g_activations, g_residual, g_q, g_k, g_v,
-                       w.gate_proj_weight, w.up_proj_weight,
-                       profiler_buffer, prof_on);
-        sm_profiler_event_end(profiler_buffer, SM_PROF_QKV_PROJ, prof_on);
-
-        sm_profiler_event_start(profiler_buffer, SM_PROF_QK_NORM_ROPE, prof_on);
-        ldg_qk_norm_rope_cache(grid, g_q, g_k, g_v,
-                               w.q_norm_weight, w.k_norm_weight,
-                               cos_table, sin_table,
-                               layer_k, layer_v,
-                               position, max_seq_len,
-                               w.o_proj_weight,
-                               kv_flag, attn_flag, layer,
-                               profiler_buffer, prof_on);
-        sm_profiler_event_end(profiler_buffer, SM_PROF_QK_NORM_ROPE, prof_on);
-
-        ldg_attention(grid, g_q, layer_k, layer_v, g_attn_out,
-                      cache_len, max_seq_len, attn_scale,
-                      w.o_proj_weight, w.gate_proj_weight, w.up_proj_weight,
-                      w.down_proj_weight,
-                      attn_flag, layer,
-                      profiler_buffer, prof_on);
-
-        sm_profiler_event_start(profiler_buffer, SM_PROF_O_PROJ_MLP, prof_on);
+        __nv_bfloat16 *layer_k = k_cache + layer * kv_layer_stride;
+        __nv_bfloat16 *layer_v = v_cache + layer * kv_layer_stride;
         bool is_last_layer = (layer == num_layers - 1);
-        ldg_o_proj_postnorm_mlp(grid,
-                                w.o_proj_weight, w.post_attn_layernorm_weight,
-                                w.gate_proj_weight, w.up_proj_weight, w.down_proj_weight,
-                                g_attn_out, g_residual, g_activations, g_mlp_intermediate,
-                                hidden_buffer,
-                                is_last_layer ? nullptr : layer_weights[layer + 1].q_proj_weight,
-                                is_last_layer ? nullptr : layer_weights[layer + 1].k_proj_weight,
-                                is_last_layer ? nullptr : layer_weights[layer + 1].v_proj_weight,
-                                is_last_layer,
-                                profiler_buffer, prof_on);
-        sm_profiler_event_end(profiler_buffer, SM_PROF_O_PROJ_MLP, prof_on);
+
+        naive_rmsnorm_qkv(grid, hidden_buffer, w.input_layernorm_weight,
+                          w.q_proj_weight, w.k_proj_weight, w.v_proj_weight,
+                          // P9 site #1: prefetch gate / up before post-QKV sync
+                          w.gate_proj_weight, w.up_proj_weight,
+                          g_normalized, g_residual, g_q, g_k, g_v);
+
+        naive_qk_norm_rope_cache(grid, g_q, g_k, g_v,
+                                 w.q_norm_weight, w.k_norm_weight,
+                                 cos_table, sin_table,
+                                 layer_k, layer_v,
+                                 position, max_seq_len,
+                                 // P9 site #2: prefetch o_proj before kv_flag spin
+                                 w.o_proj_weight,
+                                 kv_flag, layer);
+
+        naive_attention(grid, g_q, layer_k, layer_v, g_attn_out,
+                        cache_len, max_seq_len, attn_scale,
+                        w.o_proj_weight, w.gate_proj_weight,
+                        w.up_proj_weight, w.down_proj_weight,
+                        attn_flag, layer);
+
+        naive_o_proj_postnorm_mlp(grid,
+                                  w.o_proj_weight, w.post_attn_layernorm_weight,
+                                  w.gate_proj_weight, w.up_proj_weight, w.down_proj_weight,
+                                  // P9 site #4: prefetch next-layer Q/K/V before post-GU sync
+                                  is_last_layer ? nullptr : layer_weights[layer + 1].q_proj_weight,
+                                  is_last_layer ? nullptr : layer_weights[layer + 1].k_proj_weight,
+                                  is_last_layer ? nullptr : layer_weights[layer + 1].v_proj_weight,
+                                  is_last_layer,
+                                  g_attn_out, g_residual, g_activations,
+                                  g_mlp_intermediate, g_normalized,
+                                  hidden_buffer);
     }
 
-    // Final RMSNorm (block 0 only)
-    sm_profiler_event_start(profiler_buffer, SM_PROF_FINAL_NORM, prof_on);
+    // Final RMSNorm – block 0 only, writes g_normalized
     if (block_id == 0)
     {
         __shared__ float smem_reduce[LDG_NUM_WARPS];
@@ -1043,14 +996,14 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1)
             g_activations[i] = v;
             local_sum_sq += v * v;
         }
-        local_sum_sq = ldg_warp_reduce_sum(local_sum_sq);
+        local_sum_sq = warp_reduce_sum(local_sum_sq);
         if (lane_id == 0)
             smem_reduce[warp_id] = local_sum_sq;
         __syncthreads();
         if (warp_id == 0)
         {
             float sum = (lane_id < LDG_NUM_WARPS) ? smem_reduce[lane_id] : 0.0f;
-            sum = ldg_warp_reduce_sum(sum);
+            sum = warp_reduce_sum(sum);
             if (lane_id == 0)
                 smem_reduce[0] = rsqrtf(sum / float(HIDDEN_SIZE) + LDG_RMS_EPS);
         }
@@ -1062,11 +1015,11 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1)
             g_normalized[i] = g_activations[i] * rstd * wt;
         }
     }
-    sm_profiler_event_end(profiler_buffer, SM_PROF_FINAL_NORM, prof_on);
 }
 
 // =============================================================================
-// LM Head – full logits (for correctness testing)
+// LM Head – kept identical to decode_ldg.cu (not part of the megakernel
+// ablation – we only vary the persistent kernel itself).
 // =============================================================================
 
 __global__ void ldg_lm_head_logits(
@@ -1099,15 +1052,11 @@ __global__ void ldg_lm_head_logits(
                    __bfloat162float(w_ptr[2]) * s_hidden[k + 2] +
                    __bfloat162float(w_ptr[3]) * s_hidden[k + 3];
         }
-        sum = ldg_warp_reduce_sum(sum);
+        sum = warp_reduce_sum(sum);
         if (lane_id == 0)
             logits[m] = sum;
     }
 }
-
-// =============================================================================
-// LM Head – two-phase argmax (for token output)
-// =============================================================================
 
 __global__ void ldg_lm_head_phase1(
     const float *__restrict__ hidden,
@@ -1143,7 +1092,7 @@ __global__ void ldg_lm_head_phase1(
                    __bfloat162float(w_ptr[2]) * s_hidden[k + 2] +
                    __bfloat162float(w_ptr[3]) * s_hidden[k + 3];
         }
-        sum = ldg_warp_reduce_sum(sum);
+        sum = warp_reduce_sum(sum);
         if (lane_id == 0 && sum > local_max)
         {
             local_max = sum;
@@ -1165,22 +1114,22 @@ __global__ void ldg_lm_head_phase1(
 
     if (warp_id == 0)
     {
-        float max_val = (lane_id < LDG_LM_BLOCK_SIZE / WARP_SIZE) ? warp_max[lane_id] : -INFINITY;
-        int max_idx = (lane_id < LDG_LM_BLOCK_SIZE / WARP_SIZE) ? warp_idx[lane_id] : -1;
+        float mv = (lane_id < LDG_LM_BLOCK_SIZE / WARP_SIZE) ? warp_max[lane_id] : -INFINITY;
+        int mi = (lane_id < LDG_LM_BLOCK_SIZE / WARP_SIZE) ? warp_idx[lane_id] : -1;
         for (int off = WARP_SIZE / 2; off > 0; off /= 2)
         {
-            float ov = __shfl_down_sync(0xffffffff, max_val, off);
-            int oi = __shfl_down_sync(0xffffffff, max_idx, off);
-            if (ov > max_val)
+            float ov = __shfl_down_sync(0xffffffff, mv, off);
+            int oi = __shfl_down_sync(0xffffffff, mi, off);
+            if (ov > mv)
             {
-                max_val = ov;
-                max_idx = oi;
+                mv = ov;
+                mi = oi;
             }
         }
         if (lane_id == 0)
         {
-            block_max_vals[blockIdx.x] = max_val;
-            block_max_idxs[blockIdx.x] = max_idx;
+            block_max_vals[blockIdx.x] = mv;
+            block_max_idxs[blockIdx.x] = mi;
         }
     }
 }
@@ -1223,7 +1172,95 @@ __global__ void ldg_lm_head_phase2(
 }
 
 // =============================================================================
-// Launch function – decode + argmax only (no full logits)
+// Kernel launch helper (P3: regular <<<>>> launch with atomic barrier state)
+// =============================================================================
+//
+// AtomicGridSync replaces the cooperative grid sync, so a plain <<<>>> launch
+// is sufficient. ``__launch_bounds__(LDG_BLOCK_SIZE, 1)`` still pins one block
+// per SM (mandatory: co-resident blocks would deadlock the spin-wait). The
+// Python caller passes ``num_blocks = props.multiProcessorCount`` (20 on the
+// 4050 Laptop), which equals NUM_Q_HEADS + 4 idle blocks.
+//
+// Per-launch device state (allocated once, reset each call):
+//   * barrier_counter / barrier_sense — AtomicGridSync ``counter`` / ``generation``.
+//     Reset to zero before every kernel launch.
+//   * kv_flag / attn_flag             — monotonic counters bumped by partial
+//     barriers. NOT reset across launches; the kernel resets them at start
+//     (see bootstrap section).
+
+static void launch_p3_decode(
+    int input_token_id,
+    const __nv_bfloat16 *embed_weight,
+    const LDGLayerWeights *layer_weights,
+    const __nv_bfloat16 *final_norm_weight,
+    const __nv_bfloat16 *cos_table,
+    const __nv_bfloat16 *sin_table,
+    __nv_bfloat16 *k_cache,
+    __nv_bfloat16 *v_cache,
+    __nv_bfloat16 *hidden_buffer,
+    float *g_activations,
+    float *g_residual,
+    float *g_q,
+    float *g_k,
+    float *g_v,
+    float *g_attn_out,
+    float *g_mlp_intermediate,
+    float *g_normalized,
+    int num_blocks,
+    int num_layers,
+    int position,
+    int cache_len,
+    int max_seq_len,
+    float attn_scale,
+    cudaStream_t stream)
+{
+    static unsigned int *d_barrier_counter = nullptr;
+    static unsigned int *d_barrier_sense = nullptr;
+    static unsigned int *d_kv_flag = nullptr;
+    static unsigned int *d_attn_flag = nullptr;
+    static bool barrier_init = false;
+    if (!barrier_init)
+    {
+        cudaMalloc(&d_barrier_counter, sizeof(unsigned int));
+        cudaMalloc(&d_barrier_sense, sizeof(unsigned int));
+        cudaMalloc(&d_kv_flag, sizeof(unsigned int));
+        cudaMalloc(&d_attn_flag, sizeof(unsigned int));
+        barrier_init = true;
+    }
+    cudaMemsetAsync(d_barrier_counter, 0, sizeof(unsigned int), stream);
+    cudaMemsetAsync(d_barrier_sense, 0, sizeof(unsigned int), stream);
+
+    ldg_decode_kernel<<<dim3(num_blocks), dim3(LDG_BLOCK_SIZE), 0, stream>>>(
+        input_token_id,
+        embed_weight,
+        layer_weights,
+        final_norm_weight,
+        cos_table,
+        sin_table,
+        k_cache,
+        v_cache,
+        hidden_buffer,
+        g_activations,
+        g_residual,
+        g_q,
+        g_k,
+        g_v,
+        g_attn_out,
+        g_mlp_intermediate,
+        g_normalized,
+        num_layers,
+        position,
+        cache_len,
+        max_seq_len,
+        attn_scale,
+        d_barrier_counter,
+        d_barrier_sense,
+        d_kv_flag,
+        d_attn_flag);
+}
+
+// =============================================================================
+// External C ABI – matches decode_wrapper.cpp
 // =============================================================================
 
 extern "C" void launch_ldg_decode(
@@ -1257,28 +1294,11 @@ extern "C" void launch_ldg_decode(
     uint64_t *profiler_buffer,
     cudaStream_t stream)
 {
-    // Static device memory for atomic barriers
-    static unsigned int *d_barrier_counter = nullptr;
-    static unsigned int *d_barrier_sense = nullptr;
-    static unsigned int *d_kv_flag = nullptr;
-    static unsigned int *d_attn_flag = nullptr;
-    static bool barrier_init = false;
-    if (!barrier_init)
-    {
-        cudaMalloc(&d_barrier_counter, sizeof(unsigned int));
-        cudaMalloc(&d_barrier_sense, sizeof(unsigned int));
-        cudaMalloc(&d_kv_flag, sizeof(unsigned int));
-        cudaMalloc(&d_attn_flag, sizeof(unsigned int));
-        barrier_init = true;
-    }
-    // Reset barrier state before every kernel launch
-    cudaMemsetAsync(d_barrier_counter, 0, sizeof(unsigned int), stream);
-    cudaMemsetAsync(d_barrier_sense, 0, sizeof(unsigned int), stream);
-
-    ldg_decode_kernel<<<dim3(num_blocks), dim3(LDG_BLOCK_SIZE), 0, stream>>>(
+    (void)profiler_buffer; // naive variant does not emit sm-profiler events
+    launch_p3_decode(
         input_token_id,
         (const __nv_bfloat16 *)embed_weight,
-        (const LDGLayerWeights *)layer_weights,
+        layer_weights,
         (const __nv_bfloat16 *)final_norm_weight,
         (const __nv_bfloat16 *)cos_table,
         (const __nv_bfloat16 *)sin_table,
@@ -1293,18 +1313,14 @@ extern "C" void launch_ldg_decode(
         (float *)g_attn_out,
         (float *)g_mlp_intermediate,
         (float *)g_normalized,
+        num_blocks,
         num_layers,
         position,
         cache_len,
         max_seq_len,
         attn_scale,
-        profiler_buffer,
-        d_barrier_counter,
-        d_barrier_sense,
-        d_kv_flag,
-        d_attn_flag);
+        stream);
 
-    // Argmax phase 1 + 2 (no full logits)
     ldg_lm_head_phase1<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
         (const float *)g_normalized,
         (const __nv_bfloat16 *)lm_head_weight,
@@ -1317,10 +1333,6 @@ extern "C" void launch_ldg_decode(
         output_token_id,
         LDG_LM_NUM_BLOCKS);
 }
-
-// =============================================================================
-// Launch function – decode + full logits + argmax
-// =============================================================================
 
 extern "C" void launch_ldg_decode_with_logits(
     int input_token_id,
@@ -1354,28 +1366,11 @@ extern "C" void launch_ldg_decode_with_logits(
     uint64_t *profiler_buffer,
     cudaStream_t stream)
 {
-    // Static device memory for atomic barriers
-    static unsigned int *d_barrier_counter = nullptr;
-    static unsigned int *d_barrier_sense = nullptr;
-    static unsigned int *d_kv_flag = nullptr;
-    static unsigned int *d_attn_flag = nullptr;
-    static bool barrier_init = false;
-    if (!barrier_init)
-    {
-        cudaMalloc(&d_barrier_counter, sizeof(unsigned int));
-        cudaMalloc(&d_barrier_sense, sizeof(unsigned int));
-        cudaMalloc(&d_kv_flag, sizeof(unsigned int));
-        cudaMalloc(&d_attn_flag, sizeof(unsigned int));
-        barrier_init = true;
-    }
-    // Reset barrier state before every kernel launch
-    cudaMemsetAsync(d_barrier_counter, 0, sizeof(unsigned int), stream);
-    cudaMemsetAsync(d_barrier_sense, 0, sizeof(unsigned int), stream);
-
-    ldg_decode_kernel<<<dim3(num_blocks), dim3(LDG_BLOCK_SIZE), 0, stream>>>(
+    (void)profiler_buffer;
+    launch_p3_decode(
         input_token_id,
         (const __nv_bfloat16 *)embed_weight,
-        (const LDGLayerWeights *)layer_weights,
+        layer_weights,
         (const __nv_bfloat16 *)final_norm_weight,
         (const __nv_bfloat16 *)cos_table,
         (const __nv_bfloat16 *)sin_table,
@@ -1390,24 +1385,19 @@ extern "C" void launch_ldg_decode_with_logits(
         (float *)g_attn_out,
         (float *)g_mlp_intermediate,
         (float *)g_normalized,
+        num_blocks,
         num_layers,
         position,
         cache_len,
         max_seq_len,
         attn_scale,
-        profiler_buffer,
-        d_barrier_counter,
-        d_barrier_sense,
-        d_kv_flag,
-        d_attn_flag);
+        stream);
 
-    // Full logits
     ldg_lm_head_logits<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
         (const float *)g_normalized,
         (const __nv_bfloat16 *)lm_head_weight,
         logits_output);
 
-    // Argmax phase 1 + 2
     ldg_lm_head_phase1<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
         (const float *)g_normalized,
         (const __nv_bfloat16 *)lm_head_weight,

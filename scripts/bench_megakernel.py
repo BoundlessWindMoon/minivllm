@@ -20,7 +20,7 @@ from transformers import AutoTokenizer
 torch._dynamo.config.suppress_errors = True
 torch._dynamo.reset()
 
-from utils.runner import setup_env, load_eval_model, BaselineRunner, MegakernelRunner
+from engine.eval_runner import setup_env, load_eval_model, BaselineRunner, MegakernelRunner
 from utils.bench_harness import run_benchmark, print_results_table
 
 
