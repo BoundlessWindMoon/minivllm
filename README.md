@@ -8,6 +8,12 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.9-EE4C2C.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](#)
 
+<br/>
+
+<img src="docs/perf_compare.gif" alt="mini-vllm megakernel vs HF Transformers — same Qwen3-0.6B, same prompt, ~8× faster" />
+
+<sub>Qwen3-0.6B · bf16 · greedy · same prompt · 6 GB RTX 4050<br/>Left: HF Transformers · Right: mini-vllm megakernel</sub>
+
 </div>
 
 ## 🌟 Features
@@ -27,7 +33,7 @@
 
 ### 1. Environment Setup
 
-We highly recommend using [`uv`](https://github.com/astral-sh/uv) for ultra-fast dependency installation.
+using [`uv`](https://github.com/astral-sh/uv) for dependency installation.
 
 ```bash
 # Clone the repository
@@ -48,7 +54,7 @@ uv pip install -e ".[all]" -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 ### 2. Prepare Model
 
-Download your model (e.g., Qwen3-0.6B) to your local path.
+Download model (e.g., Qwen3-0.6B) to your local path.
 
 ```bash
 HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen3-0.6B --local-dir ~/huggingface/Qwen3-0.6B/
@@ -272,7 +278,7 @@ mini-vllm/
 - [x] **CUDA Graph Decode Acceleration**: Pre-capture decode graphs to remove CPU launch overhead.
 - [x] **Profiler Trace Analyzer**: Parse PyTorch profiler JSON and report kernel time breakdown.
 - [x] **Fused CUDA Megakernel**: Persistent megakernel backend with single-kernel decode pipeline.
-- [ ] **Implement EOS**: Ensure generation loops break correctly on EOS tokens.
+- [x] **Implement EOS**: Ensure generation loops break correctly on EOS tokens.
 
 ---
 

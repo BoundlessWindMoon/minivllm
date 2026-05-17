@@ -19,6 +19,7 @@ _VARIANTS_DIR = _KERNEL_DIR / "variants"
 VARIANT_SOURCES = {
     "default":      [_KERNEL_DIR / "decode_ldg.cu"],
     "naive":        [_VARIANTS_DIR / "decode_naive.cu"],
+    "no_residual":  [_VARIANTS_DIR / "decode_no_residual.cu"],
     "p0":           [_VARIANTS_DIR / "decode_p0.cu"],
     "p1":           [_VARIANTS_DIR / "decode_p1.cu"],
     "p3":           [_VARIANTS_DIR / "decode_p3.cu"],

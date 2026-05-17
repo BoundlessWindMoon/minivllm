@@ -1,6 +1,7 @@
 tmp/
 log/
-docs/
+docs/*
+!docs/perf_compare.gif
 swanlog/
 *.pyc
 *.egg-info
