@@ -11,10 +11,9 @@ inference:
   backend: megakernel_cuda             # [default, megakernel_cuda]
   megakernel_variant: all_combined             # [default, naive, p0, p1, p3, p4, p6, p7, p8, p9, p9_combined, p10, all_combined]
   check_correction: false
-  max_new_tokens: 512
+  max_new_tokens: 1024
   # prompt: "Hello, I am sakuya, I'm a 24 year old student from UCAS University. I like LLM and Infra"
-  # prompt: "我来提问题，你来回答。只需要回答ABCD。问题.1+2=?选项:A:0，B:1,C:2,D:3, 用中文思考 + 回答"
-  prompt: "明天我们去八达岭长城玩，你觉得怎么样 用中文思考 + 回答"
+  prompt: "我要去八达岭长城玩，你觉得怎么样？"
   sampling:
     sample_method: topp                 # [greedy, topp]
     temperature: 1.5
@@ -42,11 +41,11 @@ path:
   data_path: ''
   model_path: ~/huggingface/Qwen3-0.6B/
   profile_dir: ./log/profile/
-  quantized_model_path: ~/huggingface/Qwen3-8B-AWQ_Cached
+  quantized_model_path: ~/huggingface/Qwen3-0.6B-AWQ_Cached
 
 quant:
   apply_clip: true
-  backend: triton_wt_fused                # [gemm, triton, triton_wt, triton_wt_fused]
+  backend: triton_wt              # [gemm, triton, triton_wt, triton_wt_fused]
   calibration:
     data: pileval
     max_seq_length: 4096
@@ -64,4 +63,4 @@ quant:
   quant_targets:
   - MLP
   - ATTENTION
-  - LM_HEAD
+  # - LM_HEAD
