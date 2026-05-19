@@ -24,7 +24,6 @@ class Qwen3MegakernelForCausalLM(nn.Module):
     def __init__(self, base_model, max_seq_len: int = 4096, variant: str | None = None):
         super().__init__()
         self.config = base_model.config
-        self._base = base_model
         self._max_seq_len = max_seq_len
 
         cfg = self.config
@@ -50,6 +49,10 @@ class Qwen3MegakernelForCausalLM(nn.Module):
         self._lm_head_weight = w["lm_head_weight"]
         self._layer_weights_bytes = w["layer_weights_bytes"]
         self._stacked = w["stacked"]  # keep references alive
+
+        # Original model weights are no longer needed; free them.
+        del base_model
+        torch.cuda.empty_cache()
 
         # Query GPU SM count for persistent kernel grid size
         props = torch.cuda.get_device_properties(self._embed_weight.device)
