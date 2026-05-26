@@ -1,6 +1,7 @@
 """RMSNorm / LayerNorm implementations."""
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 import triton
@@ -15,7 +16,7 @@ import torch
         triton.Config({}, num_warps=16),
         triton.Config({}, num_warps=32),
     ],
-    key=['N'],
+    key=["N"],
 )
 @triton.jit
 def _rms_norm_kernel(
@@ -87,10 +88,14 @@ class RMSNorm(nn.Module):
         self,
         hidden_size: int,
         eps: float = 1e-6,
+        centered: bool = False,
     ) -> None:
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.centered = centered
+        self.weight = nn.Parameter(
+            torch.zeros(hidden_size) if centered else torch.ones(hidden_size)
+        )
 
     @torch.compile
     def rms_forward(
@@ -101,8 +106,11 @@ class RMSNorm(nn.Module):
         x = x.float()
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
-        return x
+        if self.centered:
+            x = x.mul_(1.0 + self.weight.float())
+        else:
+            x = x.mul_(self.weight.float())
+        return x.to(orig_dtype)
 
     @torch.compile
     def add_rms_forward(
@@ -115,8 +123,11 @@ class RMSNorm(nn.Module):
         residual = x.to(orig_dtype)
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
-        return x, residual
+        if self.centered:
+            x = x.mul_(1.0 + self.weight.float())
+        else:
+            x = x.mul_(self.weight.float())
+        return x.to(orig_dtype), residual
 
     def forward(
         self,
@@ -124,10 +135,34 @@ class RMSNorm(nn.Module):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
-            # return self.rms_forward(x)
+            if self.centered:
+                # Triton kernel does not support centered mode; fallback to PyTorch.
+                original_shape = x.shape
+                return self.rms_forward(x.reshape(-1, x.shape[-1])).reshape(
+                    original_shape
+                )
             original_shape = x.shape
             return triton_rms_forward(
                 x.reshape(-1, x.shape[-1]), self.weight, self.eps
             ).reshape(original_shape)
         else:
             return self.add_rms_forward(x, residual)
+
+
+class RMSNormGated(nn.Module):
+    """RMSNorm with an additional SiLU gate (used by Qwen3.5 linear attention)."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    @torch.compile
+    def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = self.weight * hidden_states.to(input_dtype)
+        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
+        return hidden_states.to(input_dtype)

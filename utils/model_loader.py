@@ -22,21 +22,26 @@ class ModelLoader:
             for file in glob(os.path.join(self.data_path, "*.safetensors")):
                 with safe_open(file, "pt", "cpu") as f:
                     for weight_name in f.keys():
-                        for k in packed_modules_mapping:
-                            if k in weight_name:
-                                v, shard_id = packed_modules_mapping[k]
-                                param_name = weight_name.replace(k, v)
-                                param = model.get_parameter(param_name)
-                                weight_loader = getattr(param, "weight_loader")
-                                weight_loader(
-                                    param, f.get_tensor(weight_name), shard_id
+                        try:
+                            for k in packed_modules_mapping:
+                                if k in weight_name:
+                                    v, shard_id = packed_modules_mapping[k]
+                                    param_name = weight_name.replace(k, v)
+                                    param = model.get_parameter(param_name)
+                                    weight_loader = getattr(param, "weight_loader")
+                                    weight_loader(
+                                        param, f.get_tensor(weight_name), shard_id
+                                    )
+                                    break
+                            else:
+                                param = model.get_parameter(weight_name)
+                                weight_loader = getattr(
+                                    param, "weight_loader", self.default_weight_loader
                                 )
-                                break
-                        else:
-                            param = model.get_parameter(weight_name)
-                            weight_loader = getattr(
-                                param, "weight_loader", self.default_weight_loader
-                            )
-                            weight_loader(param, f.get_tensor(weight_name))
+                                weight_loader(param, f.get_tensor(weight_name))
+                        except (AttributeError, RuntimeError):
+                            # Skip weights that don't have a matching parameter
+                            # (e.g. vision/MTP weights in a text-only model).
+                            pass
                         pbar.step()
         return model

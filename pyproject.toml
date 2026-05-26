@@ -19,6 +19,7 @@ dependencies = [
     "tqdm",
     "pydantic",
     "einops",
+    "flash-linear-attention",
 ]
 
 

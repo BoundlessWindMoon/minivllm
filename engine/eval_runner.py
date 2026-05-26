@@ -16,9 +16,7 @@ from transformers import AutoConfig
 from utils.config import GlobalConfig
 from utils.model_loader import ModelLoader
 from engine.context import set_context
-from model.qwen3 import Qwen3ForCausalLM
-from model.qwen3_megakernel import Qwen3MegakernelForCausalLM
-
+from model.factory import create_base_model, create_megakernel_model
 
 DEFAULT_PORT = "29599"
 
@@ -34,10 +32,14 @@ def setup_env(config_path: str | None = None):
         torch.set_default_dtype(cfg.env.get_torch_dtype())
         torch.set_default_device(cfg.env.device)
         os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", cfg.env.distributed.init_method.split(":")[-1])
+        os.environ.setdefault(
+            "MASTER_PORT", cfg.env.distributed.init_method.split(":")[-1]
+        )
         if not dist.is_initialized():
             dist.init_process_group(
-                backend=cfg.env.distributed.backend if torch.cuda.is_available() else "gloo",
+                backend=(
+                    cfg.env.distributed.backend if torch.cuda.is_available() else "gloo"
+                ),
                 init_method=cfg.env.distributed.init_method,
                 world_size=cfg.env.distributed.world_size,
                 rank=cfg.env.distributed.rank,
@@ -54,17 +56,10 @@ def setup_env(config_path: str | None = None):
     return None
 
 
-def load_eval_model(config_or_path: str | GlobalConfig | None = None, backend: str = "default"):
-    """Load a model for evaluation.
-
-    Args:
-        config_or_path: Path to YAML config, a GlobalConfig instance, or None.
-                        When None, loads from ``configs/default.yaml``.
-        backend:        ``"default"`` | ``"megakernel_cuda"``
-
-    Returns:
-        nn.Module with eval() already called.
-    """
+def load_eval_model(
+    config_or_path: str | GlobalConfig | None = None, backend: str = "default"
+):
+    """Load a model for evaluation."""
     if config_or_path is None:
         config_or_path = "configs/default.yaml"
 
@@ -79,13 +74,11 @@ def load_eval_model(config_or_path: str | GlobalConfig | None = None, backend: s
     device = cfg.env.device
 
     loader = ModelLoader(data_path)
-    model_skeleton = Qwen3ForCausalLM(config).to(device)
-    model = loader.inject_data(model_skeleton)
+    model = create_base_model(config, device, use_sdpa=cfg.inference.use_sdpa)
+    model = loader.inject_data(model)
 
     if backend == "megakernel_cuda":
-        model = Qwen3MegakernelForCausalLM.from_model(
-            model, variant=cfg.inference.megakernel_variant
-        )
+        model = create_megakernel_model(model, variant=cfg.inference.megakernel_variant)
 
     model.eval()
     return model
@@ -94,6 +87,7 @@ def load_eval_model(config_or_path: str | GlobalConfig | None = None, backend: s
 # ---------------------------------------------------------------------------
 # Unified runners
 # ---------------------------------------------------------------------------
+
 
 class _BaseRunner:
     """Common interface for baseline and megakernel runners."""
@@ -111,10 +105,11 @@ class _BaseRunner:
 class BaselineRunner(_BaseRunner):
     """Wraps Qwen3ForCausalLM with optional CUDA Graph for fair benchmarking."""
 
-    def __init__(self, model, use_cuda_graph: bool = True):
+    def __init__(self, model, use_cuda_graph: bool = True, bucket_size: int = 1):
         self.model = model
         self.device = next(model.parameters()).device
         self.use_cuda_graph = use_cuda_graph and torch.cuda.is_available()
+        self._cuda_graph_bucket_size = max(1, bucket_size)
         self._cuda_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._cuda_graph_outputs: dict[int, torch.Tensor] = {}
         self._decode_input_ids = None
@@ -131,17 +126,27 @@ class BaselineRunner(_BaseRunner):
                 (1, 1), device=self.device, dtype=torch.long
             )
 
+    def _cache_len_to_bucket(self, cache_len: int) -> int:
+        if self._cuda_graph_bucket_size <= 1:
+            return cache_len
+        if cache_len == 0:
+            return 0
+        return ((cache_len - 1) // self._cuda_graph_bucket_size + 1) * self._cuda_graph_bucket_size
+
     def _ensure_decode_graph(self, cache_len: int):
         """On-demand CUDA Graph capture for a given cache_len."""
-        if cache_len in self._cuda_graphs:
+        bucket = self._cache_len_to_bucket(cache_len)
+        if bucket in self._cuda_graphs:
             return
+
+        capture_len = bucket if self._cuda_graph_bucket_size > 1 else cache_len
 
         set_context(
             is_prefill=False,
-            cache_len=cache_len,
+            cache_len=capture_len,
             cu_seqlens_q=self._cu_seqlens_q_decode,
         )
-        self._decode_position_ids[0, 0] = cache_len
+        self._decode_position_ids[0, 0] = capture_len
 
         warmup = 3 if len(self._cuda_graphs) == 0 else 1
         for _ in range(warmup):
@@ -154,8 +159,8 @@ class BaselineRunner(_BaseRunner):
                 self._decode_input_ids, self._decode_position_ids
             )
 
-        self._cuda_graphs[cache_len] = g
-        self._cuda_graph_outputs[cache_len] = static_logits
+        self._cuda_graphs[bucket] = g
+        self._cuda_graph_outputs[bucket] = static_logits
 
     def reset(self):
         # NOTE: keep CUDA graphs alive across runs so timed loops only
@@ -186,11 +191,12 @@ class BaselineRunner(_BaseRunner):
             )
             return self.model(decoder_input_ids, decoder_position_ids)
 
+        bucket = self._cache_len_to_bucket(past_len)
         self._decode_input_ids[0, 0] = next_token
         self._decode_position_ids[0, 0] = past_len
         self._ensure_decode_graph(past_len)
-        self._cuda_graphs[past_len].replay()
-        return self._cuda_graph_outputs[past_len]
+        self._cuda_graphs[bucket].replay()
+        return self._cuda_graph_outputs[bucket]
 
 
 class MegakernelRunner(_BaseRunner):

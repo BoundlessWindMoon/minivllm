@@ -196,7 +196,7 @@ class Qwen3MegakernelForCausalLM(nn.Module):
         )
         return token_id, logits
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor = None):
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor = None, **kwargs):
         """Model forward.
 
         Returns logits of shape ``[batch, seq_len, vocab_size]``.

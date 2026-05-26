@@ -9,7 +9,7 @@ import os
 import json
 
 import torch
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer, AutoConfig, AutoProcessor
 
 from utils.logger import logger
 from utils.config import GlobalConfig, resolve_data_path
@@ -19,13 +19,18 @@ from quantization.checkpoint import (
     prepare_model_for_quantized_load,
     load_quantized_weights,
 )
-from model.qwen3 import Qwen3ForCausalLM
+from model.factory import create_base_model, create_megakernel_model
 
 
 def load_model(cfg: GlobalConfig):
     data_path = resolve_data_path(cfg)
     tokenizer = AutoTokenizer.from_pretrained(cfg.path.model_path)
     backend = cfg.inference.backend
+
+    # Propagate linear-attn backend preference into the model config so that
+    # layers can read it at construction time.
+    _la_backend = getattr(cfg.inference, "linear_attn_prefill_backend", "torch")
+    _la_decode_backend = getattr(cfg.inference, "linear_attn_decode_backend", "fla")
 
     if cfg.inference.use_quantized_model:
         if backend == "megakernel_cuda":
@@ -35,16 +40,17 @@ def load_model(cfg: GlobalConfig):
             )
         logger.info("Loading quantized model weights...")
         config = AutoConfig.from_pretrained(data_path)
-        config.use_sdpa = cfg.inference.use_sdpa
+        config.linear_attn_prefill_backend = _la_backend
+        config.linear_attn_decode_backend = _la_decode_backend
         with torch.device("meta"):
-            model_skeleton = Qwen3ForCausalLM(config)
+            model = create_base_model(config, cfg.env.device, use_sdpa=cfg.inference.use_sdpa)
         with open(os.path.join(data_path, "quant_config.json")) as f:
             quant_info = json.load(f)
-        prepare_model_for_quantized_load(model_skeleton, quant_info, cfg.quant.backend)
+        prepare_model_for_quantized_load(model, quant_info, cfg.quant.backend)
         offload_paths = list(cfg.inference.cpu_offload_modules)
-        materialize_with_offload(model_skeleton, cfg.env.device, offload_paths)
+        materialize_with_offload(model, cfg.env.device, offload_paths)
         if offload_paths:
-            apply_cpu_offload(model_skeleton, offload_paths, cfg.env.device)
+            apply_cpu_offload(model, offload_paths, cfg.env.device)
             logger.info(f"CPU offload enabled for: {offload_paths}")
             if cfg.inference.use_cuda_graph:
                 logger.warning(
@@ -54,21 +60,19 @@ def load_model(cfg: GlobalConfig):
                 )
                 cfg.inference.use_cuda_graph = False
         load_quantized_weights(
-            model_skeleton, data_path, quant_info, expected_config=cfg.quant
+            model, data_path, quant_info, expected_config=cfg.quant
         )
-        model = model_skeleton
     else:
         loader = ModelLoader(data_path)
         config = AutoConfig.from_pretrained(cfg.path.model_path)
-        config.use_sdpa = cfg.inference.use_sdpa
-        model_skeleton = Qwen3ForCausalLM(config).to(cfg.env.device)
-        model = loader.inject_data(model_skeleton)
+        config.linear_attn_prefill_backend = _la_backend
+        config.linear_attn_decode_backend = _la_decode_backend
+        model = create_base_model(config, cfg.env.device, use_sdpa=cfg.inference.use_sdpa)
+        model = loader.inject_data(model)
 
     if backend == "megakernel_cuda":
         logger.info("Switching to CUDA megakernel backend...")
-        from model.qwen3_megakernel import Qwen3MegakernelForCausalLM
-
-        model = Qwen3MegakernelForCausalLM.from_model(
+        model = create_megakernel_model(
             model, variant=cfg.inference.megakernel_variant
         )
 
@@ -88,4 +92,9 @@ def load_model(cfg: GlobalConfig):
     except (OSError, ValueError):
         pass
 
-    return model, tokenizer
+    processor = None
+    if getattr(cfg.inference, "multimodal", None) and cfg.inference.multimodal.enabled:
+        processor = AutoProcessor.from_pretrained(cfg.path.model_path, trust_remote_code=True)
+        logger.info("Loaded AutoProcessor for multimodal inference.")
+
+    return model, tokenizer, processor

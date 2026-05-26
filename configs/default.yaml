@@ -8,24 +8,24 @@ env:
     world_size: 1
 
 inference:
-  backend: megakernel_cuda             # [default, megakernel_cuda]
+  backend: default             # [default, megakernel_cuda]
   megakernel_variant: all_combined             # [default, naive, p0, p1, p3, p4, p6, p7, p8, p9, p9_combined, p10, all_combined]
   check_correction: false
-  max_new_tokens: 1024
+  max_new_tokens: 512
   # prompt: "Hello, I am sakuya, I'm a 24 year old student from UCAS University. I like LLM and Infra"
   prompt: "我要去八达岭长城玩，你觉得怎么样？"
   sampling:
-    sample_method: topp                 # [greedy, topp]
-    temperature: 1.5
+    sample_method: greedy                 # [greedy, topp]
+    temperature: 1.0
     topk: 10
     topp: 1.0
   use_cuda_graph: true
+  cuda_graph_bucket_size: 1
   use_kvcache: true
   use_profile: false
   use_quantized_model: false
   use_sdpa: true
   stop_on_eos: true
-  # Needed for chat/instruct models (Qwen3, etc.) so they emit <|im_end|> at the end of their reply.
   use_chat_template: true
   # False = direct answer (faster, may be worse on hard problems). Ignored if use_chat_template=false.
   use_thinking: true

@@ -137,6 +137,52 @@ class QKVParallelLinear(ColumnParallelLinear):
         param_data.copy_(loaded_weight)
 
 
+class QGateKVParallelLinear(ColumnParallelLinear):
+    """Merged Q+Gate / K / V projection for Qwen3.5 full attention.
+
+    q_proj in Qwen3.5 outputs both query and gate (2 * head_dim per head),
+    so this layer merges (q+gate), k, v into a single matmul.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_dim: int,
+        total_num_heads: int,
+        total_num_kv_heads: int | None = None,
+        bias: bool = False,
+    ):
+        try:
+            tp_size = dist.get_world_size()
+        except (ValueError, RuntimeError):
+            tp_size = 1
+        total_num_kv_heads = total_num_kv_heads or total_num_heads
+        self.head_dim = head_dim
+        self.num_heads = divide(total_num_heads, tp_size)
+        self.num_kv_heads = divide(total_num_kv_heads, tp_size)
+        # q_proj outputs query + gate => 2 * head_dim per head
+        self.q_gate_size = self.num_heads * self.head_dim * 2
+        self.kv_size = self.num_kv_heads * self.head_dim
+        output_size = self.q_gate_size + 2 * self.kv_size
+        super().__init__(hidden_size, output_size, bias)
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
+        param_data = param.data
+        assert loaded_shard_id in ["q", "k", "v"]
+        if loaded_shard_id == "q":
+            shard_size = self.q_gate_size
+            shard_offset = 0
+        elif loaded_shard_id == "k":
+            shard_size = self.kv_size
+            shard_offset = self.q_gate_size
+        else:
+            shard_size = self.kv_size
+            shard_offset = self.q_gate_size + self.kv_size
+        param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
+        loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+        param_data.copy_(loaded_weight)
+
+
 class RowParallelLinear(LinearBase):
 
     def __init__(

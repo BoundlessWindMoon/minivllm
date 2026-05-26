@@ -60,6 +60,13 @@ class SamplingConfig:
 
 
 @dataclass
+class MultimodalConfig:
+    enabled: bool = False
+    image_path: str = ""
+    enable_thinking: bool = False
+
+
+@dataclass
 class InferenceConfig:
     prompt: str = (
         "Hello, I am sakuya, I'm a 24 year old student from UCAS University. I like LLM and Infra"
@@ -68,6 +75,7 @@ class InferenceConfig:
     use_kvcache: bool = True
     use_sdpa: bool = True
     use_cuda_graph: bool = True
+    cuda_graph_bucket_size: int = 1
     check_correction: bool = False
     use_profile: bool = False
     backend: str = "default"
@@ -76,8 +84,11 @@ class InferenceConfig:
     stop_on_eos: bool = True
     use_chat_template: bool = False
     use_thinking: bool = True
+    linear_attn_prefill_backend: str = "torch"
+    linear_attn_decode_backend: str = "fla"
     cpu_offload_modules: List[str] = field(default_factory=list)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
+    multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
 
 
 @dataclass

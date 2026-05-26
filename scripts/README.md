@@ -63,6 +63,26 @@ python scripts/verify_megakernel.py --config configs/default.yaml --steps 5
 
 ## Profiling & Analysis
 
+### `open_profile.py`
+
+Open the latest (or a specific) PyTorch profiler trace in **Perfetto UI** (default) or Speedscope. Spins up a local HTTP server and auto-opens the browser.
+
+```bash
+# Open latest trace in Perfetto (default)
+python scripts/open_profile.py
+
+# Open a specific trace
+python scripts/open_profile.py log/profile/some_trace.pt.trace.json
+
+# Use Speedscope instead
+python scripts/open_profile.py --viewer speedscope
+
+# Custom bind address and port
+python scripts/open_profile.py --bind 0.0.0.0 --port 8080
+```
+
+---
+
 ### `run_ncu_profile.sh`
 
 Run Nsight Compute (NCU) profiling on the quantized model and generate a parsed report.

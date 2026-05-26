@@ -1,13 +1,16 @@
 """Parse PyTorch profiler Chrome trace JSON and categorize CUDA kernel time.
 
 Usage:
-    # Analyze a single trace
+    # Analyze a single trace (opens Perfetto UI by default)
     python scripts/analyze_trace.py log/profile/*.pt.trace.json
 
     # Compare quantized vs fp16 trace side-by-side
     python scripts/analyze_trace.py --compare \
         log/profile/quant_trace.pt.trace.json \
         log/profile/fp16_trace.pt.trace.json
+
+    # Text report only, skip opening browser
+    python scripts/analyze_trace.py --no-open log/profile/*.pt.trace.json
 
 Categorizes kernels into:
   - AWQ Linear (quantized matmul)
@@ -22,6 +25,7 @@ Categorizes kernels into:
 import json
 import sys
 import argparse
+import webbrowser
 from pathlib import Path
 from collections import defaultdict
 
