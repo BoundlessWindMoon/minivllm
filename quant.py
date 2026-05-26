@@ -16,7 +16,7 @@ from quantization.awq import Quantizer
 from quantization.checkpoint import save_quantized_model
 
 from transformers import AutoTokenizer, AutoConfig
-from model.qwen3 import Qwen3ForCausalLM
+from model.factory import create_base_model
 
 
 def main():
@@ -41,8 +41,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(cfg.path.model_path)
     config = AutoConfig.from_pretrained(cfg.path.model_path)
 
-    model_skeleton = Qwen3ForCausalLM(config).to(cfg.env.device)
-    model = loader.inject_data(model_skeleton)
+    model = create_base_model(config, cfg.env.device)
+    model = loader.inject_data(model)
 
     quantizer = Quantizer(
         model=model,

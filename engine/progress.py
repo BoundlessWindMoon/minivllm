@@ -1,7 +1,6 @@
 """Rich progress bars for prefill, warmup, and decode phases."""
 
 from __future__ import annotations
-from typing import Optional
 
 from rich.progress import (
     Progress,
@@ -147,7 +146,7 @@ class InferenceProgress:
                 self._progress,
             ),
             console=CONSOLE,
-            refresh_per_second=10,
+            refresh_per_second=20,
             vertical_overflow="visible",
         )
 

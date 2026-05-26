@@ -13,7 +13,7 @@ from engine.loader import load_model
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--config", default="configs/qwen3_5.yaml")
     args = parser.parse_args()
     cfg = GlobalConfig.from_yaml(args.config)
 
@@ -29,8 +29,8 @@ def main():
 
     print_runtime_config(cfg)
 
-    model, tokenizer = load_model(cfg)
-    runner = ModelRunner(model=model, tokenizer=tokenizer, cfg=cfg)
+    model, tokenizer, processor = load_model(cfg)
+    runner = ModelRunner(model=model, tokenizer=tokenizer, processor=processor, cfg=cfg)
 
     text = runner.inference()
     logger.info(f"生成结果: \n{text}")

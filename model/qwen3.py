@@ -6,14 +6,12 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from transformers import Qwen3Config
 
-from layers.activation import SiluAndMul
+from model.base import BaseCausalLM
+
 from layers.attention import Attention
 from layers.layernorm import RMSNorm
-from layers.linear import (
-    QKVParallelLinear,
-    MergedColumnParallelLinear,
-    RowParallelLinear,
-)
+from layers.linear import QKVParallelLinear, RowParallelLinear
+from layers.mlp import SiluMLP
 from layers.rotary_embedding import get_rope
 from layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from typing import (
@@ -66,12 +64,13 @@ class Qwen3Attention(nn.Module):
             hidden_size,
             bias=False,
         )
+        # NOTE: rope_scaling is ignored because our RotaryEmbedding does not
+        # support it; the base frequency is passed explicitly via `base=`.
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position,
             base=rope_theta,
-            rope_scaling=rope_scaling,
         )
         self.attn = Attention(
             self.num_heads,
@@ -109,7 +108,8 @@ class Qwen3Attention(nn.Module):
         return output
 
 
-class Qwen3MLP(nn.Module):
+class Qwen3MLP(SiluMLP):
+    """Backward-compatible alias; quantization/awq.py checks isinstance(..., Qwen3MLP)."""
 
     def __init__(
         self,
@@ -117,25 +117,8 @@ class Qwen3MLP(nn.Module):
         intermediate_size: int,
         hidden_act: str,
     ) -> None:
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-        )
         assert hidden_act == "silu"
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x):
-        gate_up = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x = self.down_proj(x)
-        return x
+        super().__init__(hidden_size, intermediate_size, bias=False)
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -212,7 +195,7 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
-class Qwen3ForCausalLM(nn.Module):
+class Qwen3ForCausalLM(BaseCausalLM):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -231,10 +214,27 @@ class Qwen3ForCausalLM(nn.Module):
         if self.config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
+    def reset(self) -> None:
+        for layer in self.model.layers:
+            layer.self_attn.attn.k_cache.zero_()
+            layer.self_attn.attn.v_cache.zero_()
+
+    def _snapshot_cuda_graph_state(self):
+        return [
+            (layer.self_attn.attn.k_cache.clone(), layer.self_attn.attn.v_cache.clone())
+            for layer in self.model.layers
+        ]
+
+    def _restore_cuda_graph_state(self, snapshot):
+        for layer, (k_cache, v_cache) in zip(self.model.layers, snapshot):
+            layer.self_attn.attn.k_cache.copy_(k_cache)
+            layer.self_attn.attn.v_cache.copy_(v_cache)
+
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> torch.Tensor:
         if positions is None:
             seq_len = input_ids.shape[1]

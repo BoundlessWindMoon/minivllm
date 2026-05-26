@@ -18,13 +18,10 @@
 
 ## 🌟 Features
 
-- **Transparent Architecture**: Cleanly separated modules for Model, Engine, and Kernels.
-- **AWQ Quantization**: Built-in 4-bit AWQ quantization support with calibration.
-- **KV Cache Management**: Simple Key-Value cache management for autoregressive decoding.
-- **W^T Layout & Fused Kernels**: Triton kernels with pre-transposed weight layout and fused dequantization for lower memory traffic.
-- **CUDA Graph Acceleration**: Pre-captured CUDA Graphs for the decode phase to eliminate CPU launch overhead.
-- **Fused CUDA Megakernel**: Optional persistent megakernel backend that fuses embedding + all transformer layers + final norm + LM head into a single kernel launch.
-- **Profiler Trace Analysis**: Built-in script to parse PyTorch profiler traces and diagnose kernel-level bottlenecks.
+- **Fused CUDA Megakernel**: Single-kernel decode pipeline that fuses embedding, all transformer layers, final norm and LM head — ~8× faster than HF Transformers on qwen3-0.6B.
+- **AWQ Quantization**: Built-in 4-bit calibration and inference with Triton/CUDA kernels and pre-transposed W^T layout.
+- **CUDA Graph Decode**: Configurable bucketed CUDA Graphs to eliminate CPU launch overhead during autoregressive generation.
+- **Profiler & Trace Analysis**: PyTorch profiler integration with Perfetto UI support and automated kernel-level bottleneck reports.
 
 
 ---
@@ -54,10 +51,14 @@ uv pip install -e ".[all]" -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 ### 2. Prepare Model
 
-Download model (e.g., Qwen3-0.6B) to your local path.
+Download a supported model (e.g., **Qwen3-0.6B** or **Qwen3.5-0.8B**) to your local path.
 
 ```bash
+# Qwen3-0.6B (default config)
 HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen3-0.6B --local-dir ~/huggingface/Qwen3-0.6B/
+
+# Qwen3.5-0.8B (multimodal + linear attention)
+HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen3.5-0.8B --local-dir ~/huggingface/Qwen3.5-0.8B/
 ```
 
 Update the path in `configs/default.yaml`:
@@ -73,15 +74,17 @@ path:
 python main.py
 ```
 
+Or use your own config file:
+```bash
+python main.py --config configs/qwen3_5.yaml
+```
+
 **Megakernel backend** — edit `configs/default.yaml`:
 ```yaml
 inference:
   backend: "megakernel_cuda"   # default | megakernel_cuda
 ```
-Then run the same command:
-```bash
-python main.py
-```
+
 
 **Quantized model inference** — enable quantized model and set the path in config:
 ```yaml
@@ -89,10 +92,6 @@ inference:
   use_quantized_model: true
 path:
   quantized_model_path: "~/huggingface/Qwen3-0.6B-AWQ_Cached"
-```
-Then run:
-```bash
-python main.py
 ```
 
 ### 4. Run Quantization (AWQ)
@@ -118,8 +117,26 @@ bash ./scripts/run_ncu_profile.sh --full
 python scripts/analyze_trace.py log/profile/*.pt.trace.json
 ```
 
-> 📖 **Full script documentation** → see [`scripts/README.md`](scripts/README.md)
+### Profiling with PyTorch Profiler + Perfetto
 
+Enable profiling in `configs/default.yaml`:
+```yaml
+inference:
+  use_profile: true
+path:
+  profile_dir: ./log/profile/
+```
+
+After inference, open the latest trace in **Perfetto UI** (default):
+
+```bash
+# Auto-detect latest trace and open in browser
+python scripts/open_profile.py
+
+# Open a specific trace file
+python scripts/open_profile.py log/profile/some_trace.pt.trace.json
+
+```
 ---
 
 ## ⚙️ Configuration
@@ -202,83 +219,30 @@ quant:
 
 ```text
 mini-vllm/
-├── configs/               # YAML configuration files
-│   ├── default.yaml
-│   └── profile.yaml
-├── engine/                # Inference engine & runtime
-│   ├── loader.py          # Top-level model loader
-│   ├── model_runner.py    # Inference loop (prefill + decode)
-│   ├── eval_runner.py     # Baseline / megakernel eval runners
-│   ├── sampler.py
-│   ├── context.py
-│   └── progress.py
-├── kernels/               # Custom kernels (Triton & CUDA)
-│   ├── awq_gemm.py
-│   ├── awq_gemm_wt.py
-│   ├── awq_gemm_wt_fused.py
-│   └── megakernel_cuda/   # Fused CUDA persistent megakernel
-│       ├── decode_ldg.cu
-│       ├── decode_wrapper.cpp
-│       └── sm_profiler.h
-├── layers/                # Built-in dense layers (Attention, MLP, RMSNorm, ...)
-├── quantization/          # AWQ search, quantized linear layers, checkpoint I/O
-│   ├── awq.py
-│   ├── checkpoint.py
-│   ├── quantized_linear.py
-│   ├── quantized_linear_wt.py
-│   ├── quant_math.py
-│   ├── scale.py
-│   ├── module_ops.py
-│   └── calibration.py
-├── model/                 # Model architectures
-│   ├── qwen3.py
-│   ├── qwen3_megakernel.py
-│   └── megakernel_weights.py
-├── scripts/               # Evaluation & development scripts
-│   ├── bench_megakernel.py
-│   ├── verify_megakernel.py
-│   ├── e2e_verify.py
-│   ├── analyze_trace.py
-│   ├── parse_ncu_csv.py
-│   ├── run_ncu_profile.sh
-│   ├── ablate.py
-│   ├── collect_ablation.py
-│   ├── convert_hf_awq.py
-│   ├── run_ablation_all.sh
-│   ├── run_variant.sh
-│   └── README.md          # Script usage documentation
-├── tools/                 # Devops / repository utilities
-│   └── bundle_sync.py
-├── utils/                 # Cross-cutting helpers (Config, Logger, CPU offload, ...)
-│   ├── config.py
-│   ├── logger.py
-│   ├── model_loader.py
-│   ├── cpu_offload.py
-│   ├── bench_harness.py
-│   └── verifier.py
-├── main.py                # Entry point: inference (fp16 / bf16 / quantized / megakernel)
-└── quant.py               # Entry point: AWQ quantization calibration
+├── configs/               # YAML configs (default.yaml, qwen3_5.yaml, ...)
+├── engine/                # Inference loop, model runner, eval runners, sampler
+├── kernels/               # Triton & CUDA kernels (AWQ gemm, fused megakernel)
+├── layers/                # Attention, MLP, RMSNorm, Rotary, Gated Delta Rule
+├── model/                 # Qwen3 / Qwen3.5 architectures, megakernel variants
+├── quantization/          # AWQ calibration, quantized layers, checkpoint I/O
+├── scripts/               # Benchmark, verify, profile, analysis tools
+├── tools/                 # Devops utilities
+├── utils/                 # Config, logger, model loader, verifier
+├── main.py                # Entry point: inference
+└── quant.py               # Entry point: AWQ calibration
 ```
 
-**Entry points:**
-- `main.py` — unified inference (auto-detects quantized weights, supports `backend: megakernel_cuda`)
-- `quant.py` — AWQ quantization calibration
-
-**No separate `run_quantized.py`** — quantized inference is handled by `main.py`.
+- `main.py --config <path>` to use a custom config.
+- Quantized inference is handled by `main.py`; no separate runner.
 
 ---
 
 ## 🗺️ Roadmap
 
-- [x] **Autoregressive Decoding & KV Cache**: Basic generation loop with Key-Value cache management.
-- [x] **AWQ Quantization & Forward Pass**: 4-bit calibration and quantized linear layer forward implementation.
-- [x] **Quantized Kernel Support**: Integrate CUDA/Triton kernels for 4-bit model inference.
-- [x] **Quantized Model Persistence**: Support saving and loading calibrated AWQ weights.
-- [x] **W^T Layout & Fused Triton Kernels**: Pre-transposed weight layout with fused kernels.
-- [x] **CUDA Graph Decode Acceleration**: Pre-capture decode graphs to remove CPU launch overhead.
-- [x] **Profiler Trace Analyzer**: Parse PyTorch profiler JSON and report kernel time breakdown.
-- [x] **Fused CUDA Megakernel**: Persistent megakernel backend with single-kernel decode pipeline.
-- [x] **Implement EOS**: Ensure generation loops break correctly on EOS tokens.
+- [x] Autoregressive decoding with KV cache, CUDA Graph acceleration, and EOS handling
+- [x] AWQ 4-bit quantization with calibration, W^T layout, and Triton/CUDA kernels
+- [x] Fused CUDA megakernel (single-kernel decode pipeline)
+- [x] PyTorch profiler integration with trace analysis
 
 ---
 

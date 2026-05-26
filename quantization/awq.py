@@ -33,6 +33,7 @@ from layers.linear import (
 from layers.embed_head import ParallelLMHead
 from quantization.quantized_linear import WQLinear_W
 from quantization.quantized_linear_wt import WQLinear_Wt
+from layers.mlp import SiluMLP
 from model.qwen3 import (
     Qwen3DecoderLayer,
     Qwen3Attention,
@@ -171,7 +172,7 @@ class Quantizer:
                 use_cache=False,
             )
 
-        elif isinstance(module, Qwen3MLP):
+        elif isinstance(module, SiluMLP):
             return module(x)
 
         else:

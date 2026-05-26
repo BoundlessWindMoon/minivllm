@@ -31,6 +31,8 @@ VARIANT_SOURCES = {
     "p9_combined":  [_VARIANTS_DIR / "decode_p9_combined.cu"],
     "p10":          [_VARIANTS_DIR / "decode_p10.cu"],
     "all_combined": [_VARIANTS_DIR / "decode_all_combined.cu"],
+    "qwen3_5": [_VARIANTS_DIR / "decode_qwen3_5.cu", _KERNEL_DIR / "decode_wrapper_qwen3_5.cpp"],
+    "qwen3_5_ldg": [_VARIANTS_DIR / "decode_qwen3_5_ldg.cu", _KERNEL_DIR / "decode_wrapper_qwen3_5_ldg.cpp"],
 }
 
 _modules: dict[str, object] = {}
@@ -58,7 +60,9 @@ def _get_module(variant: str | None = None):
         return _modules[variant]
 
     sources = [str(p) for p in VARIANT_SOURCES[variant]]
-    sources.append(str(_KERNEL_DIR / "decode_wrapper.cpp"))
+    # Only append default wrapper if variant doesn't bring its own
+    if not any("wrapper" in s for s in sources):
+        sources.append(str(_KERNEL_DIR / "decode_wrapper.cpp"))
 
     # Skip variants whose .cu file doesn't exist yet (in-progress ablation work).
     missing = [s for s in sources if not Path(s).exists()]

@@ -1,21 +1,14 @@
 """Loguru-based logging with file and optional console sinks."""
 
 import os
-import sys
 from datetime import datetime
 from loguru import logger
-from engine.progress import CONSOLE
 
 logger.remove()
 
 timestamp = datetime.now().strftime("%Y%m%d_%H")
 log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "log", timestamp)
 os.makedirs(log_dir, exist_ok=True)
-
-
-def rich_sink(message):
-    CONSOLE.print(message, end="")
-
 
 logger.add(
     os.path.join(log_dir, "all.log"),
@@ -34,5 +27,10 @@ logger.add(
     retention="30 days",
     encoding="utf-8",
 )
+
+# NOTE: We intentionally do NOT add a console/terminal sink here.
+# Log output competes with rich Live/Panel rendering and causes ghosting
+# when the terminal is resized or scrolled.  All logs go to files only;
+# runtime progress and generated text are shown via rich in engine/progress.py.
 
 __all__ = ["logger"]
