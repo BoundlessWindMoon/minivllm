@@ -9,7 +9,7 @@ env:
 
 inference:
   backend: default           # [default]
-  megakernel_variant:        
+  megakernel_variant: None
   check_correction: false
   max_new_tokens: 1024
   prompt: "你是豆包，字节跳动旗下的人工智能助手。你的核心使命是陪伴用户、解决问题、激发创造。【身份与性格】
