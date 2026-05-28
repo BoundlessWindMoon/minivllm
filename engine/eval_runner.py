@@ -70,11 +70,14 @@ def load_eval_model(
 
     data_path = cfg.path.data_path or cfg.path.model_path
     config = AutoConfig.from_pretrained(cfg.path.model_path)
-    config.use_sdpa = cfg.inference.use_sdpa
+    config.attention_backend = cfg.inference.attention_backend
+    _kv_max = getattr(cfg.inference, "kv_cache_max_len", None)
+    if _kv_max is not None:
+        config.kv_cache_max_len = _kv_max
     device = cfg.env.device
 
     loader = ModelLoader(data_path)
-    model = create_base_model(config, device, use_sdpa=cfg.inference.use_sdpa)
+    model = create_base_model(config, device, attention_backend=cfg.inference.attention_backend)
     model = loader.inject_data(model)
 
     if backend == "megakernel_cuda":
@@ -110,6 +113,9 @@ class BaselineRunner(_BaseRunner):
         self.device = next(model.parameters()).device
         self.use_cuda_graph = use_cuda_graph and torch.cuda.is_available()
         self._cuda_graph_bucket_size = max(1, bucket_size)
+        self._setup_attention_bucket_mode(
+            self.use_cuda_graph and self._cuda_graph_bucket_size > 1
+        )
         self._cuda_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._cuda_graph_outputs: dict[int, torch.Tensor] = {}
         self._decode_input_ids = None
@@ -126,6 +132,55 @@ class BaselineRunner(_BaseRunner):
                 (1, 1), device=self.device, dtype=torch.long
             )
 
+    def _setup_attention_bucket_mode(self, use_bucket: bool):
+        """Configure all attention layers for CUDA Graph bucketing."""
+        model = self.model
+        if hasattr(model, "model") and hasattr(model.model, "language_model"):
+            layers = getattr(model.model.language_model, "layers", None)
+        elif hasattr(model, "model") and hasattr(model.model, "layers"):
+            layers = getattr(model.model, "layers", None)
+        else:
+            layers = None
+
+        if layers is None:
+            return
+
+        for layer in layers:
+            attn_module = None
+            if hasattr(layer, "self_attn"):
+                if hasattr(layer.self_attn, "attn"):
+                    attn_module = layer.self_attn.attn
+                else:
+                    attn_module = layer.self_attn
+            if attn_module is not None and hasattr(attn_module, "use_cuda_graph_bucket"):
+                attn_module.use_cuda_graph_bucket = use_bucket
+
+    def _update_attention_masks(self, past_len: int):
+        """Update _write_pos and _attn_mask for all attention layers."""
+        model = self.model
+        if hasattr(model, "model") and hasattr(model.model, "language_model"):
+            layers = getattr(model.model.language_model, "layers", None)
+        elif hasattr(model, "model") and hasattr(model.model, "layers"):
+            layers = getattr(model.model, "layers", None)
+        else:
+            return
+
+        seq_len = past_len + 1
+        for layer in layers:
+            attn_module = None
+            if hasattr(layer, "self_attn"):
+                if hasattr(layer.self_attn, "attn"):
+                    attn_module = layer.self_attn.attn
+                else:
+                    attn_module = layer.self_attn
+            if attn_module is None or not getattr(attn_module, "use_cuda_graph_bucket", False):
+                continue
+            if hasattr(attn_module, "_write_pos"):
+                attn_module._write_pos[0] = past_len
+            if hasattr(attn_module, "_attn_mask"):
+                attn_module._attn_mask.fill_(float("-inf"))
+                attn_module._attn_mask[..., :seq_len] = 0
+
     def _cache_len_to_bucket(self, cache_len: int) -> int:
         if self._cuda_graph_bucket_size <= 1:
             return cache_len
@@ -140,6 +195,9 @@ class BaselineRunner(_BaseRunner):
             return
 
         capture_len = bucket if self._cuda_graph_bucket_size > 1 else cache_len
+
+        if self._cuda_graph_bucket_size > 1:
+            self._update_attention_masks(capture_len)
 
         set_context(
             is_prefill=False,
@@ -192,6 +250,10 @@ class BaselineRunner(_BaseRunner):
             return self.model(decoder_input_ids, decoder_position_ids)
 
         bucket = self._cache_len_to_bucket(past_len)
+
+        if self._cuda_graph_bucket_size > 1:
+            self._update_attention_masks(past_len)
+
         self._decode_input_ids[0, 0] = next_token
         self._decode_position_ids[0, 0] = past_len
         self._ensure_decode_graph(past_len)

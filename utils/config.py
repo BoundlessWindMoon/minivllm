@@ -67,13 +67,22 @@ class MultimodalConfig:
 
 
 @dataclass
+class KVCacheConfig:
+    backend: str = "default"  # "default" | "kivi"
+    k_bits: int = 2
+    v_bits: int = 2
+    group_size: int = 32
+    residual_length: int = 32
+
+
+@dataclass
 class InferenceConfig:
     prompt: str = (
         "Hello, I am sakuya, I'm a 24 year old student from UCAS University. I like LLM and Infra"
     )
     max_new_tokens: int = 128
     use_kvcache: bool = True
-    use_sdpa: bool = True
+    attention_backend: str = "sdpa"  # [flash_attn, sdpa, naive]
     use_cuda_graph: bool = True
     cuda_graph_bucket_size: int = 1
     check_correction: bool = False
@@ -89,6 +98,8 @@ class InferenceConfig:
     cpu_offload_modules: List[str] = field(default_factory=list)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
+    kv_cache_max_len: int | None = None
+    kv_cache: KVCacheConfig = field(default_factory=KVCacheConfig)
 
 
 @dataclass
@@ -136,6 +147,25 @@ class GlobalConfig:
 
         with open(yaml_path, 'r', encoding='utf-8') as f:
             yaml_dict = yaml.safe_load(f)
+
+        # Backward-compat: migrate old boolean flags to attention_backend
+        inference = yaml_dict.get("inference", {})
+        if "use_flash_attn" in inference or "use_sdpa" in inference:
+            use_fa = inference.pop("use_flash_attn", False)
+            use_sdpa = inference.pop("use_sdpa", True)
+            if use_fa:
+                inference["attention_backend"] = "flash_attn"
+            elif use_sdpa:
+                inference["attention_backend"] = "sdpa"
+            else:
+                inference["attention_backend"] = "naive"
+            import warnings
+            warnings.warn(
+                "Config fields 'use_sdpa' and 'use_flash_attn' are deprecated. "
+                f"Use 'attention_backend: {inference['attention_backend']}' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
         config = from_dict(data_class=cls, data=yaml_dict)
         return config
@@ -195,7 +225,7 @@ def print_runtime_config(cfg):
         variant = env_variant or getattr(cfg.inference, "megakernel_variant", "default")
         suffix = " (via MINI_VLLM_MK_VARIANT)" if env_variant else ""
         table.add_row("megakernel_variant", variant + suffix)
-    table.add_row("use_sdpa", str(cfg.inference.use_sdpa))
+    table.add_row("attention_backend", str(cfg.inference.attention_backend))
     table.add_row("use_cuda_graph", str(cfg.inference.use_cuda_graph))
     table.add_row("use_kvcache", str(cfg.inference.use_kvcache))
     table.add_row("use_chat_template", str(cfg.inference.use_chat_template))

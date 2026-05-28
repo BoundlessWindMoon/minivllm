@@ -32,7 +32,7 @@ def _default_torch_factory(model_cls: type[BaseCausalLM]):
 def create_base_model(
     config: PretrainedConfig,
     device: str | torch.device,
-    use_sdpa: bool = True,
+    attention_backend: str = "sdpa",
 ) -> BaseCausalLM:
     """Create a *native PyTorch* model from a HF config."""
     model_type = getattr(config, "model_type", None)
@@ -44,7 +44,7 @@ def create_base_model(
             f"Did you forget to import the model module so its ``register_model()`` runs?"
         )
 
-    config.use_sdpa = use_sdpa
+    config.attention_backend = attention_backend
     factory = _REGISTRY[model_type]["torch"]
     return factory(config, str(device))
 

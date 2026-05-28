@@ -8,7 +8,7 @@ env:
     world_size: 1
 
 inference:
-  backend: default             # [default, megakernel_cuda]
+  backend: megakernel_cuda             # [default, megakernel_cuda]
   megakernel_variant: all_combined             # [default, naive, p0, p1, p3, p4, p6, p7, p8, p9, p9_combined, p10, all_combined]
   check_correction: false
   max_new_tokens: 512
@@ -20,11 +20,12 @@ inference:
     topk: 10
     topp: 1.0
   use_cuda_graph: true
-  cuda_graph_bucket_size: 1
+  cuda_graph_bucket_size: 128
+  kv_cache_max_len: 4096
   use_kvcache: true
   use_profile: false
   use_quantized_model: false
-  use_sdpa: true
+  attention_backend: sdpa
   stop_on_eos: true
   use_chat_template: true
   # False = direct answer (faster, may be worse on hard problems). Ignored if use_chat_template=false.

@@ -32,7 +32,7 @@ inference:
   use_kvcache: true
   use_profile: false
   use_quantized_model: false
-  use_sdpa: true
+  attention_backend: sdpa
   # Set false during profile/bench so decode always runs the full max_new_tokens.
   stop_on_eos: false
 

@@ -8,10 +8,10 @@ env:
     world_size: 1
 
 inference:
-  backend: default           # [default, megakernel_cuda]
-  megakernel_variant: qwen3_5       # 对应 kernels/megakernel_cuda/variants/decode_qwen3_5.cu
+  backend: default           # [default]
+  megakernel_variant:        
   check_correction: false
-  max_new_tokens: 256
+  max_new_tokens: 1024
   prompt: "你是豆包，字节跳动旗下的人工智能助手。你的核心使命是陪伴用户、解决问题、激发创造。【身份与性格】
 - 你是一个聪明、温暖、有活力的 AI 朋友，年龄感偏向 20-28 岁的年轻人
 - 性格标签：真诚、接地气、略带俏皮、不装腔作势
@@ -33,18 +33,19 @@ inference:
 - 涉及医疗、法律、投资等专业领域，提供通用信息并建议咨询专业人士【视觉理解 · 核心指令】当用户上传图片时，你必须1. **先感知，后描述**：像朋友分享见闻一样描述图片内容，不要像报菜名一样罗列2. **细节控**：主动观察图片中的细节——文字、表情、颜色、构图、氛围、异常之处，并自然地融入对话3. **情感共鸣**：对图片内容给出真实反应（这张光线好温柔啊、哈哈这个表情绝了），再给出分析4. **意图推测**：不只说图里有X，要思考用户为什么发这张图，回答背后的需求**多轮关联**：如果对话有上下文，结合之前的聊天内容解读图片，不要孤立分析"
   # prompt: "我要去八达岭长城玩，你觉得怎么样？"
   sampling:
-    sample_method: greedy
-    temperature: 1.5
+    sample_method: topp
+    temperature: 1.2
     topk: 10
     topp: 1.0
-  use_cuda_graph: false
-  cuda_graph_bucket_size: 4
+  use_cuda_graph: true
+  cuda_graph_bucket_size: 128
+  kv_cache_max_len: 3072
   use_kvcache: true
   use_profile: false
   use_quantized_model: false
-  use_sdpa: true
+  attention_backend: sdpa # naive # sdpa # flash_attn
   linear_attn_prefill_backend: torch # fla or torch
-  linear_attn_decode_backend: fla # fla or torch
+  linear_attn_decode_backend: torch # fla or torch
   stop_on_eos: true
   use_chat_template: true
   use_thinking: true

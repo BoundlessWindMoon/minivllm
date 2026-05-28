@@ -36,7 +36,9 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
-        use_sdpa: bool = True,
+        attention_backend: str = "sdpa",
+        use_cuda_graph_bucket: bool = False,
+        kv_cache_max_len: int | None = None,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -78,7 +80,9 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
             max_position=max_position,
-            use_sdpa=use_sdpa,
+            max_seq_len=kv_cache_max_len if kv_cache_max_len is not None else max_position,
+            attention_backend=attention_backend,
+            use_cuda_graph_bucket=use_cuda_graph_bucket,
         )
         if not self.qkv_bias:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -138,7 +142,9 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
-            use_sdpa=getattr(config, 'use_sdpa', True),
+            attention_backend=getattr(config, 'attention_backend', 'sdpa'),
+            use_cuda_graph_bucket=getattr(config, 'use_cuda_graph_bucket', False),
+            kv_cache_max_len=getattr(config, "kv_cache_max_len", None),
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
@@ -218,6 +224,10 @@ class Qwen3ForCausalLM(BaseCausalLM):
         for layer in self.model.layers:
             layer.self_attn.attn.k_cache.zero_()
             layer.self_attn.attn.v_cache.zero_()
+            if hasattr(layer.self_attn.attn, "_write_pos"):
+                layer.self_attn.attn._write_pos.zero_()
+            if hasattr(layer.self_attn.attn, "_attn_mask"):
+                layer.self_attn.attn._attn_mask.fill_(float("-inf"))
 
     def _snapshot_cuda_graph_state(self):
         return [
