@@ -89,6 +89,7 @@ class InferenceConfig:
     cpu_offload_modules: List[str] = field(default_factory=list)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
+    kv_cache_max_len: int | None = None
 
 
 @dataclass

@@ -42,6 +42,9 @@ def load_model(cfg: GlobalConfig):
         config = AutoConfig.from_pretrained(data_path)
         config.linear_attn_prefill_backend = _la_backend
         config.linear_attn_decode_backend = _la_decode_backend
+        _kv_max = getattr(cfg.inference, "kv_cache_max_len", None)
+        if _kv_max is not None:
+            config.kv_cache_max_len = _kv_max
         with torch.device("meta"):
             model = create_base_model(config, cfg.env.device, use_sdpa=cfg.inference.use_sdpa)
         with open(os.path.join(data_path, "quant_config.json")) as f:
@@ -67,6 +70,9 @@ def load_model(cfg: GlobalConfig):
         config = AutoConfig.from_pretrained(cfg.path.model_path)
         config.linear_attn_prefill_backend = _la_backend
         config.linear_attn_decode_backend = _la_decode_backend
+        _kv_max = getattr(cfg.inference, "kv_cache_max_len", None)
+        if _kv_max is not None:
+            config.kv_cache_max_len = _kv_max
         model = create_base_model(config, cfg.env.device, use_sdpa=cfg.inference.use_sdpa)
         model = loader.inject_data(model)
 

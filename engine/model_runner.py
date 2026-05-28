@@ -89,6 +89,9 @@ class ModelRunner:
         )
         if self._cuda_graph_bucket_size < 1:
             self._cuda_graph_bucket_size = 1
+        self._setup_attention_bucket_mode(
+            self.use_cuda_graph and self._cuda_graph_bucket_size > 1
+        )
         self._cuda_graphs = {}
         self._cuda_graph_outputs = {}
         self._decode_input_ids = None
@@ -176,6 +179,55 @@ class ModelRunner:
                 "KVCACHE is not enabled, please enable it for better performance"
             )
             assert self.use_kvcache == True
+
+    def _setup_attention_bucket_mode(self, use_bucket: bool):
+        """Configure all attention layers for CUDA Graph bucketing."""
+        model = self.model
+        if hasattr(model, "model") and hasattr(model.model, "language_model"):
+            layers = getattr(model.model.language_model, "layers", None)
+        elif hasattr(model, "model") and hasattr(model.model, "layers"):
+            layers = getattr(model.model, "layers", None)
+        else:
+            layers = None
+
+        if layers is None:
+            return
+
+        for layer in layers:
+            attn_module = None
+            if hasattr(layer, "self_attn"):
+                if hasattr(layer.self_attn, "attn"):
+                    attn_module = layer.self_attn.attn
+                else:
+                    attn_module = layer.self_attn
+            if attn_module is not None and hasattr(attn_module, "use_cuda_graph_bucket"):
+                attn_module.use_cuda_graph_bucket = use_bucket
+
+    def _update_attention_masks(self, past_len: int):
+        """Update _write_pos and _attn_mask for all attention layers."""
+        model = self.model
+        if hasattr(model, "model") and hasattr(model.model, "language_model"):
+            layers = getattr(model.model.language_model, "layers", None)
+        elif hasattr(model, "model") and hasattr(model.model, "layers"):
+            layers = getattr(model.model, "layers", None)
+        else:
+            return
+
+        seq_len = past_len + 1
+        for layer in layers:
+            attn_module = None
+            if hasattr(layer, "self_attn"):
+                if hasattr(layer.self_attn, "attn"):
+                    attn_module = layer.self_attn.attn
+                else:
+                    attn_module = layer.self_attn
+            if attn_module is None or not getattr(attn_module, "use_cuda_graph_bucket", False):
+                continue
+            if hasattr(attn_module, "_write_pos"):
+                attn_module._write_pos[0] = past_len
+            if hasattr(attn_module, "_attn_mask"):
+                attn_module._attn_mask.fill_(float("-inf"))
+                attn_module._attn_mask[..., :seq_len] = 0
 
     def _prepare_multimodal_inputs(self, multimodal_cfg, use_thinking: bool):
         from PIL import Image
@@ -400,6 +452,9 @@ class ModelRunner:
         # same graph can be replayed for any cache_len within the bucket.
         capture_len = bucket if self._cuda_graph_bucket_size > 1 else cache_len
 
+        if self._cuda_graph_bucket_size > 1:
+            self._update_attention_masks(capture_len)
+
         set_context(
             is_prefill=False,
             cache_len=capture_len,
@@ -504,6 +559,10 @@ class ModelRunner:
 
         cache_len = past_len
         bucket = self._cache_len_to_bucket(cache_len)
+
+        if self._cuda_graph_bucket_size > 1:
+            self._update_attention_masks(past_len)
+
         self._decode_input_ids.copy_(next_token.reshape(1, 1))
         self._decode_position_ids[0, 0] = past_len
         self._ensure_decode_graph(cache_len)

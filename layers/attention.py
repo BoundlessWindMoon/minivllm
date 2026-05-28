@@ -63,6 +63,7 @@ class Attention(nn.Module):
         max_position,
         max_seq_len: int = 4096,
         use_sdpa: bool = True,
+        use_cuda_graph_bucket: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -72,6 +73,7 @@ class Attention(nn.Module):
         self.max_seq_len = max_seq_len
         self.max_position = max_position
         self.use_sdpa = use_sdpa
+        self.use_cuda_graph_bucket = use_cuda_graph_bucket
         self.batch_size = 1
         self.register_buffer(
             "k_cache",
@@ -85,6 +87,17 @@ class Attention(nn.Module):
             torch.zeros(
                 self.batch_size, self.num_kv_heads, self.max_seq_len, self.head_dim
             ),
+            persistent=False,
+        )
+        # Buffers for CUDA Graph bucketing (always allocated; gated by use_cuda_graph_bucket).
+        self.register_buffer(
+            "_write_pos",
+            torch.zeros(1, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_attn_mask",
+            torch.full((1, 1, 1, self.max_seq_len), float("-inf")),
             persistent=False,
         )
 
@@ -123,15 +136,27 @@ class Attention(nn.Module):
         v = v.transpose(1, 2)
 
         seq_len = q.shape[2]
-        self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
-        self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
+        batch_size = q.shape[0]
 
         if is_prefill:
+            self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
+            self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
             k_for_attn = k
             v_for_attn = v
         else:
-            k_for_attn = self.k_cache[:, :, : cache_len + seq_len, :]
-            v_for_attn = self.v_cache[:, :, : cache_len + seq_len, :]
+            if self.use_cuda_graph_bucket:
+                write_idx = self._write_pos.view(1, 1, 1, 1).expand(
+                    batch_size, self.num_kv_heads, seq_len, self.head_dim
+                )
+                self.k_cache.scatter_(2, write_idx, k)
+                self.v_cache.scatter_(2, write_idx, v)
+                k_for_attn = self.k_cache
+                v_for_attn = self.v_cache
+            else:
+                self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
+                self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
+                k_for_attn = self.k_cache[:, :, : cache_len + seq_len, :]
+                v_for_attn = self.v_cache[:, :, : cache_len + seq_len, :]
 
         n_rep = self.num_heads // self.num_kv_heads
         if self.use_sdpa:
@@ -143,9 +168,15 @@ class Attention(nn.Module):
                     q, k_for_attn, v_for_attn, is_causal=True
                 )
             else:
-                o = F.scaled_dot_product_attention(
-                    q, k_for_attn, v_for_attn, is_causal=False
-                )
+                if self.use_cuda_graph_bucket:
+                    o = F.scaled_dot_product_attention(
+                        q, k_for_attn, v_for_attn,
+                        attn_mask=self._attn_mask, is_causal=False,
+                    )
+                else:
+                    o = F.scaled_dot_product_attention(
+                        q, k_for_attn, v_for_attn, is_causal=False
+                    )
         else:
             n_rep = self.num_heads // self.num_kv_heads
             if n_rep > 1:
@@ -155,12 +186,15 @@ class Attention(nn.Module):
             attn_weights = torch.matmul(q, k_for_attn.transpose(-2, -1)) * self.scale
 
             seq_len_q = q.shape[2]
-            seq_len_k = k_for_attn.shape[2]
-            causal_mask = torch.triu(
-                torch.ones(seq_len_q, seq_len_k, device=q.device, dtype=torch.bool),
-                diagonal=seq_len_k - seq_len_q + 1,
-            )
-            attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
+            if is_prefill:
+                seq_len_k = k_for_attn.shape[2]
+                causal_mask = torch.triu(
+                    torch.ones(seq_len_q, seq_len_k, device=q.device, dtype=torch.bool),
+                    diagonal=seq_len_k - seq_len_q + 1,
+                )
+                attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
+            elif self.use_cuda_graph_bucket:
+                attn_weights = attn_weights + self._attn_mask
             attn_weights = torch.softmax(attn_weights, dim=-1)
             o = torch.matmul(attn_weights, v_for_attn)
 
