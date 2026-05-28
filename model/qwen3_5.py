@@ -37,7 +37,7 @@ USE_TRITON = True
 
 
 class Qwen3_5Attention(nn.Module):
-    def __init__(self, config: Qwen3_5Config, layer_idx: int, use_cuda_graph_bucket: bool = False):
+    def __init__(self, config: Qwen3_5Config, layer_idx: int, attention_backend: str = "sdpa", use_cuda_graph_bucket: bool = False):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -61,17 +61,44 @@ class Qwen3_5Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, centered=True)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, centered=True)
 
+        self.attention_backend = attention_backend
+        if attention_backend == "flash_attn":
+            try:
+                from flash_attn import flash_attn_with_kvcache
+                self._flash_attn_with_kvcache = flash_attn_with_kvcache
+            except Exception:
+                import logging
+                logging.warning(
+                    "attention_backend='flash_attn' but flash-attn is not installed. "
+                    "Falling back to 'sdpa'."
+                )
+                self.attention_backend = "sdpa"
+
         self.max_seq_len = getattr(config, "kv_cache_max_len", config.max_position_embeddings)
-        self.register_buffer(
-            "k_cache",
-            torch.zeros(1, self.num_kv_heads, self.max_seq_len, self.head_dim),
-            persistent=False,
-        )
-        self.register_buffer(
-            "v_cache",
-            torch.zeros(1, self.num_kv_heads, self.max_seq_len, self.head_dim),
-            persistent=False,
-        )
+        if self.attention_backend == "flash_attn":
+            # BSHD layout for Flash Attention
+            self.register_buffer(
+                "k_cache",
+                torch.zeros(1, self.max_seq_len, self.num_kv_heads, self.head_dim),
+                persistent=False,
+            )
+            self.register_buffer(
+                "v_cache",
+                torch.zeros(1, self.max_seq_len, self.num_kv_heads, self.head_dim),
+                persistent=False,
+            )
+        else:
+            # BHSD layout for SDPA / naive
+            self.register_buffer(
+                "k_cache",
+                torch.zeros(1, self.num_kv_heads, self.max_seq_len, self.head_dim),
+                persistent=False,
+            )
+            self.register_buffer(
+                "v_cache",
+                torch.zeros(1, self.num_kv_heads, self.max_seq_len, self.head_dim),
+                persistent=False,
+            )
         # Buffers for CUDA Graph bucketing (always allocated; gated by use_cuda_graph_bucket).
         self.register_buffer(
             "_write_pos",
@@ -133,44 +160,65 @@ class Qwen3_5Attention(nn.Module):
             is_prefill = True
             cache_len = 0
 
-        if is_prefill:
-            self.k_cache[:, :, cache_len : cache_len + seq_len, :] = key_states
-            self.v_cache[:, :, cache_len : cache_len + seq_len, :] = value_states
-            k_for_attn = key_states
-            v_for_attn = value_states
-        else:
-            if self.use_cuda_graph_bucket:
-                write_idx = self._write_pos.view(1, 1, 1, 1).expand(
-                    batch_size, self.num_kv_heads, seq_len, self.head_dim
+        if self.attention_backend == "flash_attn":
+            # FA expects BSHD; current tensors are BHSD
+            q_bshd = query_states.transpose(1, 2)
+            k_bshd = key_states.transpose(1, 2)
+            v_bshd = value_states.transpose(1, 2)
+            if is_prefill:
+                attn_output = self._flash_attn_with_kvcache(
+                    q_bshd, self.k_cache, self.v_cache,
+                    k=k_bshd, v=v_bshd,
+                    cache_seqlens=cache_len,
+                    causal=True,
                 )
-                self.k_cache.scatter_(2, write_idx, key_states)
-                self.v_cache.scatter_(2, write_idx, value_states)
-                k_for_attn = self.k_cache
-                v_for_attn = self.v_cache
             else:
+                attn_output = self._flash_attn_with_kvcache(
+                    q_bshd, self.k_cache, self.v_cache,
+                    k=k_bshd, v=v_bshd,
+                    cache_seqlens=cache_len,
+                    causal=False,
+                )
+            attn_output = attn_output.transpose(1, 2)
+        else:
+            if is_prefill:
                 self.k_cache[:, :, cache_len : cache_len + seq_len, :] = key_states
                 self.v_cache[:, :, cache_len : cache_len + seq_len, :] = value_states
-                k_for_attn = self.k_cache[:, :, : cache_len + seq_len, :]
-                v_for_attn = self.v_cache[:, :, : cache_len + seq_len, :]
+                k_for_attn = key_states
+                v_for_attn = value_states
+            else:
+                if self.use_cuda_graph_bucket:
+                    write_idx = self._write_pos.view(1, 1, 1, 1).expand(
+                        batch_size, self.num_kv_heads, seq_len, self.head_dim
+                    )
+                    self.k_cache.scatter_(2, write_idx, key_states)
+                    self.v_cache.scatter_(2, write_idx, value_states)
+                    k_for_attn = self.k_cache
+                    v_for_attn = self.v_cache
+                else:
+                    self.k_cache[:, :, cache_len : cache_len + seq_len, :] = key_states
+                    self.v_cache[:, :, cache_len : cache_len + seq_len, :] = value_states
+                    k_for_attn = self.k_cache[:, :, : cache_len + seq_len, :]
+                    v_for_attn = self.v_cache[:, :, : cache_len + seq_len, :]
 
-        if self.num_kv_groups > 1:
-            k_for_attn = k_for_attn.repeat_interleave(self.num_kv_groups, dim=1)
-            v_for_attn = v_for_attn.repeat_interleave(self.num_kv_groups, dim=1)
+            if self.num_kv_groups > 1:
+                k_for_attn = k_for_attn.repeat_interleave(self.num_kv_groups, dim=1)
+                v_for_attn = v_for_attn.repeat_interleave(self.num_kv_groups, dim=1)
 
-        if is_prefill:
-            attn_output = F.scaled_dot_product_attention(
-                query_states, k_for_attn, v_for_attn, is_causal=True
-            )
-        else:
-            if self.use_cuda_graph_bucket:
+            if is_prefill:
                 attn_output = F.scaled_dot_product_attention(
-                    query_states, k_for_attn, v_for_attn,
-                    attn_mask=self._attn_mask, is_causal=False,
+                    query_states, k_for_attn, v_for_attn, is_causal=True
                 )
             else:
-                attn_output = F.scaled_dot_product_attention(
-                    query_states, k_for_attn, v_for_attn, is_causal=False
-                )
+                if self.use_cuda_graph_bucket:
+                    attn_output = F.scaled_dot_product_attention(
+                        query_states, k_for_attn, v_for_attn,
+                        attn_mask=self._attn_mask, is_causal=False,
+                    )
+                else:
+                    attn_output = F.scaled_dot_product_attention(
+                        query_states, k_for_attn, v_for_attn, is_causal=False
+                    )
 
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1)
         attn_output = attn_output * torch.sigmoid(gate)
@@ -416,7 +464,11 @@ class Qwen3_5DecoderLayer(nn.Module):
         if self.layer_type == "linear_attention":
             self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)
         elif self.layer_type == "full_attention":
-            self.self_attn = Qwen3_5Attention(config, layer_idx)
+            self.self_attn = Qwen3_5Attention(
+                config, layer_idx,
+                use_cuda_graph_bucket=getattr(config, 'use_cuda_graph_bucket', False),
+                attention_backend=getattr(config, 'attention_backend', 'sdpa'),
+            )
         self.mlp = Qwen3_5MLP(config)
         self.input_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, centered=True

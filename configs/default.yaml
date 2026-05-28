@@ -25,7 +25,7 @@ inference:
   use_kvcache: true
   use_profile: false
   use_quantized_model: false
-  use_sdpa: true
+  attention_backend: sdpa
   stop_on_eos: true
   use_chat_template: true
   # False = direct answer (faster, may be worse on hard problems). Ignored if use_chat_template=false.

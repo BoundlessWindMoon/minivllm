@@ -70,14 +70,14 @@ def load_eval_model(
 
     data_path = cfg.path.data_path or cfg.path.model_path
     config = AutoConfig.from_pretrained(cfg.path.model_path)
-    config.use_sdpa = cfg.inference.use_sdpa
+    config.attention_backend = cfg.inference.attention_backend
     _kv_max = getattr(cfg.inference, "kv_cache_max_len", None)
     if _kv_max is not None:
         config.kv_cache_max_len = _kv_max
     device = cfg.env.device
 
     loader = ModelLoader(data_path)
-    model = create_base_model(config, device, use_sdpa=cfg.inference.use_sdpa)
+    model = create_base_model(config, device, attention_backend=cfg.inference.attention_backend)
     model = loader.inject_data(model)
 
     if backend == "megakernel_cuda":

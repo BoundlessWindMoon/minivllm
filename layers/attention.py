@@ -9,6 +9,13 @@ import torch.nn.functional as F
 from utils.logger import logger
 from engine.context import get_context
 
+try:
+    from flash_attn import flash_attn_with_kvcache
+
+    _FA_AVAILABLE = True
+except Exception:
+    _FA_AVAILABLE = False
+
 
 @triton.jit
 def store_kvcache_kernel(
@@ -62,8 +69,9 @@ class Attention(nn.Module):
         num_kv_heads,
         max_position,
         max_seq_len: int = 4096,
-        use_sdpa: bool = True,
+        attention_backend: str = "sdpa",
         use_cuda_graph_bucket: bool = False,
+        kv_backend=None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -72,23 +80,79 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.max_seq_len = max_seq_len
         self.max_position = max_position
-        self.use_sdpa = use_sdpa
+        self.attention_backend = attention_backend
         self.use_cuda_graph_bucket = use_cuda_graph_bucket
         self.batch_size = 1
-        self.register_buffer(
-            "k_cache",
-            torch.zeros(
-                self.batch_size, self.num_kv_heads, self.max_seq_len, self.head_dim
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "v_cache",
-            torch.zeros(
-                self.batch_size, self.num_kv_heads, self.max_seq_len, self.head_dim
-            ),
-            persistent=False,
-        )
+        self.kv_backend = kv_backend
+
+        if attention_backend == "flash_attn" and not _FA_AVAILABLE:
+            logger.warning(
+                "attention_backend='flash_attn' but flash-attn is not installed. "
+                "Falling back to 'sdpa'."
+            )
+            self.attention_backend = "sdpa"
+
+        if self.kv_backend is not None and self.use_cuda_graph_bucket:
+            raise ValueError(
+                "KVCacheBackend does not support CUDA Graph bucketing. "
+                "Set use_cuda_graph_bucket=False when using a custom kv_backend."
+            )
+        if self.kv_backend is not None and self.attention_backend == "flash_attn":
+            raise ValueError(
+                "KVCacheBackend does not support Flash Attention. "
+                "Set attention_backend='sdpa' or 'naive' when using a custom kv_backend."
+            )
+
+        if self.kv_backend is None:
+            if self.attention_backend == "flash_attn":
+                # BSHD layout for Flash Attention
+                self.register_buffer(
+                    "k_cache",
+                    torch.zeros(
+                        self.batch_size,
+                        self.max_seq_len,
+                        self.num_kv_heads,
+                        self.head_dim,
+                    ),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    "v_cache",
+                    torch.zeros(
+                        self.batch_size,
+                        self.max_seq_len,
+                        self.num_kv_heads,
+                        self.head_dim,
+                    ),
+                    persistent=False,
+                )
+            else:
+                # BHSD layout for SDPA / naive
+                self.register_buffer(
+                    "k_cache",
+                    torch.zeros(
+                        self.batch_size,
+                        self.num_kv_heads,
+                        self.max_seq_len,
+                        self.head_dim,
+                    ),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    "v_cache",
+                    torch.zeros(
+                        self.batch_size,
+                        self.num_kv_heads,
+                        self.max_seq_len,
+                        self.head_dim,
+                    ),
+                    persistent=False,
+                )
+        else:
+            # backend manages its own storage
+            self.register_buffer("k_cache", None, persistent=False)
+            self.register_buffer("v_cache", None, persistent=False)
+
         # Buffers for CUDA Graph bucketing (always allocated; gated by use_cuda_graph_bucket).
         self.register_buffer(
             "_write_pos",
@@ -138,13 +202,45 @@ class Attention(nn.Module):
         seq_len = q.shape[2]
         batch_size = q.shape[0]
 
+        if self.attention_backend == "flash_attn":
+            q_bshd = q.transpose(1, 2)
+            k_bshd = k.transpose(1, 2)
+            v_bshd = v.transpose(1, 2)
+            if is_prefill:
+                o = flash_attn_with_kvcache(
+                    q_bshd,
+                    self.k_cache,
+                    self.v_cache,
+                    k=k_bshd,
+                    v=v_bshd,
+                    cache_seqlens=cache_len,
+                    causal=True,
+                )
+            else:
+                o = flash_attn_with_kvcache(
+                    q_bshd,
+                    self.k_cache,
+                    self.v_cache,
+                    k=k_bshd,
+                    v=v_bshd,
+                    cache_seqlens=cache_len,
+                    causal=False,
+                )
+            return o
+
         if is_prefill:
-            self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
-            self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
+            if self.kv_backend is not None:
+                self.kv_backend.update(k, v, cache_len, is_prefill=True)
+            else:
+                self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
+                self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
             k_for_attn = k
             v_for_attn = v
         else:
-            if self.use_cuda_graph_bucket:
+            if self.kv_backend is not None:
+                self.kv_backend.update(k, v, cache_len, is_prefill=False)
+                k_for_attn, v_for_attn = self.kv_backend.get_kv(cache_len + seq_len)
+            elif self.use_cuda_graph_bucket:
                 write_idx = self._write_pos.view(1, 1, 1, 1).expand(
                     batch_size, self.num_kv_heads, seq_len, self.head_dim
                 )
@@ -159,7 +255,7 @@ class Attention(nn.Module):
                 v_for_attn = self.v_cache[:, :, : cache_len + seq_len, :]
 
         n_rep = self.num_heads // self.num_kv_heads
-        if self.use_sdpa:
+        if self.attention_backend == "sdpa":
             if n_rep > 1:
                 k_for_attn = k_for_attn.repeat_interleave(n_rep, dim=1)
                 v_for_attn = v_for_attn.repeat_interleave(n_rep, dim=1)
@@ -170,15 +266,18 @@ class Attention(nn.Module):
             else:
                 if self.use_cuda_graph_bucket:
                     o = F.scaled_dot_product_attention(
-                        q, k_for_attn, v_for_attn,
-                        attn_mask=self._attn_mask, is_causal=False,
+                        q,
+                        k_for_attn,
+                        v_for_attn,
+                        attn_mask=self._attn_mask,
+                        is_causal=False,
                     )
                 else:
                     o = F.scaled_dot_product_attention(
                         q, k_for_attn, v_for_attn, is_causal=False
                     )
         else:
-            n_rep = self.num_heads // self.num_kv_heads
+            # naive
             if n_rep > 1:
                 k_for_attn = k_for_attn.repeat_interleave(n_rep, dim=1)
                 v_for_attn = v_for_attn.repeat_interleave(n_rep, dim=1)
