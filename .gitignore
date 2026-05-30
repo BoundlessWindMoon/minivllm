@@ -5,3 +5,4 @@ docs/*
 swanlog/
 *.pyc
 *.egg-info
+eval/results/

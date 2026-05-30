@@ -13,7 +13,7 @@ from engine.processor import load_processor
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/qwen3_5.yaml")
+    parser.add_argument("--config", default="configs/default.yaml")
     args = parser.parse_args()
     cfg = GlobalConfig.from_yaml(args.config)
 

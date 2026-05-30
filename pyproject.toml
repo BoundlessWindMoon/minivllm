@@ -1,14 +1,14 @@
 [project]
 name = "mini-vllm"
 version = "0.1.0"
-description = "A lightweight, easy-to-understand inference and quantization engine for LLMs."
+description = "A lightweight inference and quantization engine for LLMs."
 readme = "README.md"
-requires-python = ">=3.10" 
+requires-python = ">=3.10"
 license = { text = "MIT" }
 
 dependencies = [
-    "torch>=2.0",
-    "transformers==4.51.0",
+    "torch==2.9.0",
+    "transformers>=5.9.0",
     "accelerate",
     "safetensors",
     "datasets",
@@ -19,11 +19,17 @@ dependencies = [
     "tqdm",
     "pydantic",
     "einops",
-    "flash-linear-attention",
+    "Pillow",
 ]
 
 
 [project.optional-dependencies]
+flash_attn = [
+    "flash-attn",
+]
+benchmark = [
+    "lm-eval",
+]
 quant = [
     "autoawq",
 ]
@@ -35,7 +41,7 @@ monitor = [
     "swanlab",
 ]
 all = [
-    "mini-vllm[quant,profile,monitor]"
+    "mini-vllm[flash_attn,benchmark,quant,profile,monitor]",
 ]
 
 
@@ -44,4 +50,4 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["model*", "engine*", "layers*", "utils*", "kernels*"]
+include = ["model*", "engine*", "layers*", "utils*", "kernels*", "eval*"]
