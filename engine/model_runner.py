@@ -127,7 +127,9 @@ class ModelRunner:
                         f"Note: bucketing requires kernel support for padded lengths."
                     )
                 else:
-                    logger.info("[CUDA Graph] Enabled for decode phase (exact per-step).")
+                    logger.info(
+                        "[CUDA Graph] Enabled for decode phase (exact per-step)."
+                    )
 
         sampling_cfg = cfg.inference.sampling
         self.sampler = Sampler(
@@ -182,46 +184,15 @@ class ModelRunner:
 
     def _setup_attention_bucket_mode(self, use_bucket: bool):
         """Configure all attention layers for CUDA Graph bucketing."""
-        model = self.model
-        if hasattr(model, "model") and hasattr(model.model, "language_model"):
-            layers = getattr(model.model.language_model, "layers", None)
-        elif hasattr(model, "model") and hasattr(model.model, "layers"):
-            layers = getattr(model.model, "layers", None)
-        else:
-            layers = None
-
-        if layers is None:
-            return
-
-        for layer in layers:
-            attn_module = None
-            if hasattr(layer, "self_attn"):
-                if hasattr(layer.self_attn, "attn"):
-                    attn_module = layer.self_attn.attn
-                else:
-                    attn_module = layer.self_attn
-            if attn_module is not None and hasattr(attn_module, "use_cuda_graph_bucket"):
+        for attn_module in self.model.iter_attention_modules():
+            if hasattr(attn_module, "use_cuda_graph_bucket"):
                 attn_module.use_cuda_graph_bucket = use_bucket
 
     def _update_attention_masks(self, past_len: int):
         """Update _write_pos and _attn_mask for all attention layers."""
-        model = self.model
-        if hasattr(model, "model") and hasattr(model.model, "language_model"):
-            layers = getattr(model.model.language_model, "layers", None)
-        elif hasattr(model, "model") and hasattr(model.model, "layers"):
-            layers = getattr(model.model, "layers", None)
-        else:
-            return
-
         seq_len = past_len + 1
-        for layer in layers:
-            attn_module = None
-            if hasattr(layer, "self_attn"):
-                if hasattr(layer.self_attn, "attn"):
-                    attn_module = layer.self_attn.attn
-                else:
-                    attn_module = layer.self_attn
-            if attn_module is None or not getattr(attn_module, "use_cuda_graph_bucket", False):
+        for attn_module in self.model.iter_attention_modules():
+            if not getattr(attn_module, "use_cuda_graph_bucket", False):
                 continue
             if hasattr(attn_module, "_write_pos"):
                 attn_module._write_pos[0] = past_len
@@ -241,9 +212,6 @@ class ModelRunner:
             logger.warning(
                 f"Multimodal image not found at {image_path}; using synthetic test image."
             )
-
-        # Terminal image rendering removed — too low resolution for useful display.
-        # Use `utils.terminal_image.print_image(image)` if you need it.
 
         messages = [
             {
@@ -301,7 +269,7 @@ class ModelRunner:
                 generated_ids = []
 
                 # ==========================================
-                # 1. Prefill 阶段 & PPL 验证
+                # 1. Prefill
                 # ==========================================
                 pbar.start_prefill()
                 cu_seqlens_q_prefill = torch.tensor(
@@ -332,7 +300,7 @@ class ModelRunner:
                 past_len += prompt_seq_len
                 pbar.end_prefill(next_token.item())
                 # ==========================================
-                # 2. Decode 阶段 & 贪婪解码验证
+                # 2. Decode
                 # ==========================================
                 if self.check_correction and self.verifier is not None:
                     logger.info("[ModelRunner] 生成 baseline 的 greedy decode 结果...")
@@ -346,12 +314,8 @@ class ModelRunner:
                 if self.use_cuda_graph:
                     self._decode_input_ids.copy_(next_token.reshape(1, 1))
                     pbar.start_warmup(total=max_new_tokens + 2)
-                    # Pre-capture graphs for models that support it.
-                    # Models without pre-capture support fall back to on-demand
-                    # capture in run_decode.
-                    can_precapture = hasattr(
-                        self.model, "_snapshot_cuda_graph_state"
-                    )
+
+                    can_precapture = hasattr(self.model, "_snapshot_cuda_graph_state")
                     if can_precapture:
                         self._capture_all_decode_graphs(past_len, max_new_tokens, pbar)
                     pbar.end_warmup()
@@ -431,11 +395,12 @@ class ModelRunner:
         """
         if self._cuda_graph_bucket_size <= 1:
             return cache_len
-        # Round up to next multiple of bucket_size.
-        # cache_len 0 is kept as 0 (first decode step after prefill).
+
         if cache_len == 0:
             return 0
-        return ((cache_len - 1) // self._cuda_graph_bucket_size + 1) * self._cuda_graph_bucket_size
+        return (
+            (cache_len - 1) // self._cuda_graph_bucket_size + 1
+        ) * self._cuda_graph_bucket_size
 
     def _ensure_decode_graph(self, cache_len: int, restore_state: bool = True):
         """On-demand capture a decode graph for the given cache_len.
@@ -448,12 +413,7 @@ class ModelRunner:
         if bucket in self._cuda_graphs:
             return
 
-        # When bucketing, capture with the bucket upper bound so that the
-        # same graph can be replayed for any cache_len within the bucket.
         capture_len = bucket if self._cuda_graph_bucket_size > 1 else cache_len
-
-        if self._cuda_graph_bucket_size > 1:
-            self._update_attention_masks(capture_len)
 
         set_context(
             is_prefill=False,
@@ -462,8 +422,6 @@ class ModelRunner:
         )
         self._decode_position_ids[0, 0] = capture_len
 
-        # Snapshot state for models with non-idempotent decode state
-        # (e.g. megakernel linear attention recurrent states)
         state_snapshot = None
         if restore_state and hasattr(self.model, "_snapshot_cuda_graph_state"):
             state_snapshot = self.model._snapshot_cuda_graph_state()
@@ -485,9 +443,10 @@ class ModelRunner:
                 decode_position=capture_len,
             )
 
-        # Restore state so replay starts from the correct pre-step state
-        if restore_state and state_snapshot is not None and hasattr(
-            self.model, "_restore_cuda_graph_state"
+        if (
+            restore_state
+            and state_snapshot is not None
+            and hasattr(self.model, "_restore_cuda_graph_state")
         ):
             self.model._restore_cuda_graph_state(state_snapshot)
 
@@ -499,18 +458,18 @@ class ModelRunner:
         end_cache_len = start_cache_len + num_tokens - 1
         start_bucket = self._cache_len_to_bucket(start_cache_len)
         end_bucket = self._cache_len_to_bucket(end_cache_len)
-        # Count unique buckets in the range.
         if self._cuda_graph_bucket_size <= 1:
             unique_buckets = num_tokens
         else:
-            unique_buckets = (end_bucket - start_bucket) // self._cuda_graph_bucket_size + 1
+            unique_buckets = (
+                end_bucket - start_bucket
+            ) // self._cuda_graph_bucket_size + 1
 
         logger.info(
             f"[CUDA Graph] Pre-capturing {unique_buckets} graphs "
             f"(cache_len {start_cache_len} ~ {end_cache_len}, bucket_size={self._cuda_graph_bucket_size}) ..."
         )
 
-        # Use model-level snapshot if available (handles linear attention, etc.)
         has_custom_snapshot = hasattr(self.model, "_snapshot_cuda_graph_state")
         state_snapshot = (
             self.model._snapshot_cuda_graph_state() if has_custom_snapshot else None
@@ -528,9 +487,7 @@ class ModelRunner:
                 self._ensure_decode_graph(cache_len, restore_state=False)
                 pbar.step_warmup(1)
         finally:
-            if has_custom_snapshot and hasattr(
-                self.model, "_restore_cuda_graph_state"
-            ):
+            if has_custom_snapshot and hasattr(self.model, "_restore_cuda_graph_state"):
                 self.model._restore_cuda_graph_state(state_snapshot)
             logger.info("[CUDA Graph] State restored to pre-capture state.")
 

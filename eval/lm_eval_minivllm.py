@@ -14,6 +14,8 @@ from lm_eval.api.registry import register_model
 
 from utils.config import GlobalConfig
 from engine.loader import load_model
+from engine.runtime_setup import apply_runtime_patches
+from engine.processor import load_processor
 from engine.context import set_context
 
 
@@ -47,7 +49,9 @@ class MiniVLLM(TemplateLM):
                 rank=0, world_size=1,
             )
 
-        self.model, self.tokenizer, self.processor = load_model(self.cfg)
+        self.model, self.tokenizer = load_model(self.cfg)
+        self.model = apply_runtime_patches(self.model, self.cfg)
+        self.processor = load_processor(self.cfg)
         self.model.eval()
         # Disable any fast path that bypasses logits
         if hasattr(self.model, "greedy_fast_path"):

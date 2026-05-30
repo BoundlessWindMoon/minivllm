@@ -162,6 +162,9 @@ class Qwen3_5MegakernelForCausalLM(nn.Module):
     def from_model(cls, model, max_seq_len: int = 4096, variant: str | None = None):
         return cls(model, max_seq_len=max_seq_len, variant=variant)
 
+    def iter_attention_modules(self):
+        yield from ()
+
     def reset(self):
         self._position = 0
         self.rope_deltas = None

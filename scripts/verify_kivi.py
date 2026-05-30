@@ -20,6 +20,7 @@ import torch
 
 from utils.config import GlobalConfig
 from engine.loader import load_model
+from engine.runtime_setup import apply_runtime_patches
 from engine.context import set_context
 
 
@@ -54,18 +55,12 @@ def greedy_decode(model, tokenizer, prompt: str, max_tokens: int, device: str):
 
 def reset_kv_cache(model):
     """Zero out or reset all KV cache backends."""
-    layers = getattr(getattr(model, "model", None), "layers", None)
-    if layers is None:
-        return
-    for layer in layers:
-        attn = getattr(getattr(layer, "self_attn", None), "attn", None)
-        if attn is None:
-            continue
-        if attn.kv_backend is not None:
-            attn.kv_backend.reset()
-        elif hasattr(attn, "k_cache") and attn.k_cache is not None:
-            attn.k_cache.zero_()
-            attn.v_cache.zero_()
+    for attn_module in model.iter_attention_modules():
+        if getattr(attn_module, "kv_backend", None) is not None:
+            attn_module.kv_backend.reset()
+        elif hasattr(attn_module, "k_cache") and attn_module.k_cache is not None:
+            attn_module.k_cache.zero_()
+            attn_module.v_cache.zero_()
 
 
 def main():
@@ -97,7 +92,7 @@ def main():
     print("[Baseline] Loading model with default KV cache...")
     cfg.inference.use_cuda_graph = False
     cfg.inference.backend = "default"
-    model, tokenizer, _ = load_model(cfg)
+    model, tokenizer = load_model(cfg)
 
     reset_kv_cache(model)
     baseline_tokens = greedy_decode(model, tokenizer, args.prompt, args.max_tokens, device)
@@ -113,7 +108,8 @@ def main():
     cfg.inference.kv_cache.group_size = args.group_size
     cfg.inference.kv_cache.residual_length = args.residual_length
 
-    model_kivi, tokenizer_kivi, _ = load_model(cfg)
+    model_kivi, tokenizer_kivi = load_model(cfg)
+    model_kivi = apply_runtime_patches(model_kivi, cfg)
 
     reset_kv_cache(model_kivi)
     kivi_tokens = greedy_decode(model_kivi, tokenizer_kivi, args.prompt, args.max_tokens, device)

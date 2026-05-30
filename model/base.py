@@ -21,3 +21,11 @@ class BaseCausalLM(nn.Module):
 
     def reset(self) -> None:
         pass
+
+    def iter_attention_modules(self):
+        """Yield attention modules for inspection / runtime patching.
+
+        Subclasses must override this so that model runners can access
+        attention layers without hard-coding attribute paths.
+        """
+        raise NotImplementedError
