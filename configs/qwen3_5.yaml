@@ -45,7 +45,7 @@ inference:
   attention_backend: sdpa              # naive # sdpa # flash_attn
   linear_attn_prefill_backend: torch         # fla or torch
   linear_attn_decode_backend: torch          # fla or torch
-  stop_on_eos: false
+  stop_on_eos: true
   use_chat_template: true
   use_thinking: true
   cpu_offload_modules: []
