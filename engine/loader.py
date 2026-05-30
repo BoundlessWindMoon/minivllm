@@ -33,6 +33,7 @@ def _propagate_config_fields(config, cfg: GlobalConfig):
     _kv_max = getattr(cfg.inference, "kv_cache_max_len", None)
     if _kv_max is not None:
         config.kv_cache_max_len = _kv_max
+    config.preallocate_cache = cfg.inference.use_cuda_graph
 
 
 def _load_weights(model, cfg: GlobalConfig, data_path: str):

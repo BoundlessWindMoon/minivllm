@@ -76,6 +76,32 @@ class KVCacheConfig:
 
 
 @dataclass
+class TorchProfilerConfig:
+    enabled: bool = False
+    profile_dir: str = "./log/profile/"
+
+
+@dataclass
+class SwanLabConfig:
+    enabled: bool = False
+    project: str = "mini-vllm"
+    experiment_name: str | None = None
+
+
+@dataclass
+class JSONProfilerConfig:
+    enabled: bool = False
+    path: str = "profile.json"
+
+
+@dataclass
+class ProfilingConfig:
+    torch_profiler: TorchProfilerConfig = field(default_factory=TorchProfilerConfig)
+    swanlab: SwanLabConfig = field(default_factory=SwanLabConfig)
+    json: JSONProfilerConfig = field(default_factory=JSONProfilerConfig)
+
+
+@dataclass
 class InferenceConfig:
     prompt: str = (
         "Hello, I am sakuya, I'm a 24 year old student from UCAS University. I like LLM and Infra"
@@ -138,6 +164,7 @@ class GlobalConfig:
     path: PathConfig = field(default_factory=PathConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     quant: QuantConfig = field(default_factory=QuantConfig)
+    profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "GlobalConfig":

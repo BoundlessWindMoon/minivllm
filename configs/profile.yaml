@@ -30,7 +30,6 @@ inference:
     topp: 1.0
   use_cuda_graph: false
   use_kvcache: true
-  use_profile: false
   use_quantized_model: false
   attention_backend: sdpa
   # Set false during profile/bench so decode always runs the full max_new_tokens.
@@ -64,3 +63,15 @@ quant:
   - MLP
   - ATTENTION
   - LM_HEAD
+
+profiling:
+  torch_profiler:
+    enabled: true
+    profile_dir: ./log/profile/
+  swanlab:
+    enabled: false
+    project: mini-vllm
+    experiment_name: null
+  json:
+    enabled: false
+    path: ./log/profile/profile.json

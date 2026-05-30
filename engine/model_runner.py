@@ -7,6 +7,7 @@ import warnings
 from utils.logger import logger
 from engine.context import get_context, set_context
 from engine.progress import InferenceProgress
+from engine.profiler import build_profiler
 from engine.sampler import Sampler
 
 try:
@@ -36,9 +37,7 @@ class ModelRunner:
         self.device = cfg.env.device
         self.max_new_tokens = cfg.inference.max_new_tokens
         self.check_correction = cfg.inference.check_correction
-        self.use_profile = cfg.inference.use_profile
         self.use_kvcache = cfg.inference.use_kvcache
-        self.profile_dir = cfg.path.profile_dir
         self.stop_on_eos = getattr(cfg.inference, "stop_on_eos", True)
         self.eos_token_ids = self._collect_eos_ids() if self.stop_on_eos else set()
 
@@ -161,21 +160,7 @@ class ModelRunner:
                 device=self.device,
             )
 
-        self.prof = None
-        if self.use_profile:
-            schedule = torch.profiler.schedule(wait=0, warmup=2, active=20, repeat=1)
-            self.prof = torch.profiler.profile(
-                schedule=schedule,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    self.profile_dir
-                ),
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=True,
-            )
-            logger.info(
-                f"[Profiler] Enabled (decode-only). Trace will be saved to {self.profile_dir}"
-            )
+        self.profiler = build_profiler(cfg)
         if not self.use_kvcache:
             logger.error(
                 "KVCACHE is not enabled, please enable it for better performance"
@@ -260,10 +245,8 @@ class ModelRunner:
         input_ids = self.input_ids
         position_ids = self.position_ids
         prompt_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-        from contextlib import nullcontext
-
         with InferenceProgress(tokenizer, max_new_tokens, prompt_text) as pbar:
-            with self.prof if self.prof else nullcontext():
+            with self.profiler.scope("decode"):
                 prompt_seq_len = input_ids.shape[1]
                 past_len = 0
                 generated_ids = []
@@ -326,10 +309,8 @@ class ModelRunner:
                     torch.cuda.synchronize()
                     torch.cuda.cudart().cudaProfilerStart()
                 while current_tokens < max_new_tokens and not stopped_by_eos:
-                    logits = self.run_decode(next_token, past_len)
-
-                    if self.prof:
-                        self.prof.step()
+                    with self.profiler.step(step=current_tokens):
+                        logits = self.run_decode(next_token, past_len)
 
                     next_token = self.sampler.sample(logits)
                     if (
@@ -475,11 +456,8 @@ class ModelRunner:
             self.model._snapshot_cuda_graph_state() if has_custom_snapshot else None
         )
 
-        prof_was_running = False
-        if self.prof is not None:
-            self.prof.stop()
-            prof_was_running = True
-            logger.info("[CUDA Graph] Profiler paused for capture.")
+        self.profiler.pause()
+        logger.info("[CUDA Graph] Profiler paused for capture.")
 
         try:
             for i in range(num_tokens):
@@ -491,9 +469,8 @@ class ModelRunner:
                 self.model._restore_cuda_graph_state(state_snapshot)
             logger.info("[CUDA Graph] State restored to pre-capture state.")
 
-            if prof_was_running:
-                self.prof.start()
-                logger.info("[CUDA Graph] Profiler resumed after capture.")
+            self.profiler.resume()
+            logger.info("[CUDA Graph] Profiler resumed after capture.")
 
         logger.info(f"[CUDA Graph] Pre-captured {len(self._cuda_graphs)} graphs.")
 

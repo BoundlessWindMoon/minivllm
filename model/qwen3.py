@@ -39,6 +39,7 @@ class Qwen3Attention(nn.Module):
         attention_backend: str = "sdpa",
         use_cuda_graph_bucket: bool = False,
         kv_cache_max_len: int | None = None,
+        preallocate_cache: bool = True,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -83,6 +84,7 @@ class Qwen3Attention(nn.Module):
             max_seq_len=kv_cache_max_len if kv_cache_max_len is not None else max_position,
             attention_backend=attention_backend,
             use_cuda_graph_bucket=use_cuda_graph_bucket,
+            preallocate_cache=preallocate_cache,
         )
         if not self.qkv_bias:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -145,6 +147,7 @@ class Qwen3DecoderLayer(nn.Module):
             attention_backend=getattr(config, 'attention_backend', 'sdpa'),
             use_cuda_graph_bucket=getattr(config, 'use_cuda_graph_bucket', False),
             kv_cache_max_len=getattr(config, "kv_cache_max_len", None),
+            preallocate_cache=getattr(config, 'preallocate_cache', True),
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
@@ -222,8 +225,9 @@ class Qwen3ForCausalLM(BaseCausalLM):
 
     def reset(self) -> None:
         for layer in self.model.layers:
-            layer.self_attn.attn.k_cache.zero_()
-            layer.self_attn.attn.v_cache.zero_()
+            if layer.self_attn.attn.k_cache is not None:
+                layer.self_attn.attn.k_cache.zero_()
+                layer.self_attn.attn.v_cache.zero_()
             if hasattr(layer.self_attn.attn, "_write_pos"):
                 layer.self_attn.attn._write_pos.zero_()
             if hasattr(layer.self_attn.attn, "_attn_mask"):
@@ -235,12 +239,18 @@ class Qwen3ForCausalLM(BaseCausalLM):
 
     def _snapshot_cuda_graph_state(self):
         return [
-            (layer.self_attn.attn.k_cache.clone(), layer.self_attn.attn.v_cache.clone())
+            (
+                (layer.self_attn.attn.k_cache.clone(), layer.self_attn.attn.v_cache.clone())
+                if layer.self_attn.attn.k_cache is not None else None
+            )
             for layer in self.model.layers
         ]
 
     def _restore_cuda_graph_state(self, snapshot):
-        for layer, (k_cache, v_cache) in zip(self.model.layers, snapshot):
+        for layer, snap in zip(self.model.layers, snapshot):
+            if snap is None:
+                continue
+            k_cache, v_cache = snap
             layer.self_attn.attn.k_cache.copy_(k_cache)
             layer.self_attn.attn.v_cache.copy_(v_cache)
 

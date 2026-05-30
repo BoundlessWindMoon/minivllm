@@ -48,7 +48,6 @@ def store_kvcache(
     v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
 ):
-    # Handle both (N, num_heads, head_dim) and (N*num_heads, head_dim) shapes
     if len(key.shape) == 3:
         N, num_heads, head_dim = key.shape
         D = num_heads * head_dim
@@ -72,6 +71,7 @@ class Attention(nn.Module):
         attention_backend: str = "sdpa",
         use_cuda_graph_bucket: bool = False,
         kv_backend=None,
+        preallocate_cache: bool = True,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -84,6 +84,7 @@ class Attention(nn.Module):
         self.use_cuda_graph_bucket = use_cuda_graph_bucket
         self.batch_size = 1
         self.kv_backend = kv_backend
+        self.preallocate_cache = preallocate_cache
 
         if attention_backend == "flash_attn" and not _FA_AVAILABLE:
             logger.warning(
@@ -104,56 +105,56 @@ class Attention(nn.Module):
             )
 
         if self.kv_backend is None:
-            if self.attention_backend == "flash_attn":
-                # BSHD layout for Flash Attention
-                self.register_buffer(
-                    "k_cache",
-                    torch.zeros(
-                        self.batch_size,
-                        self.max_seq_len,
-                        self.num_kv_heads,
-                        self.head_dim,
-                    ),
-                    persistent=False,
-                )
-                self.register_buffer(
-                    "v_cache",
-                    torch.zeros(
-                        self.batch_size,
-                        self.max_seq_len,
-                        self.num_kv_heads,
-                        self.head_dim,
-                    ),
-                    persistent=False,
-                )
+            if self.preallocate_cache:
+                if self.attention_backend == "flash_attn":
+                    self.register_buffer(
+                        "k_cache",
+                        torch.zeros(
+                            self.batch_size,
+                            self.max_seq_len,
+                            self.num_kv_heads,
+                            self.head_dim,
+                        ),
+                        persistent=False,
+                    )
+                    self.register_buffer(
+                        "v_cache",
+                        torch.zeros(
+                            self.batch_size,
+                            self.max_seq_len,
+                            self.num_kv_heads,
+                            self.head_dim,
+                        ),
+                        persistent=False,
+                    )
+                else:
+                    self.register_buffer(
+                        "k_cache",
+                        torch.zeros(
+                            self.batch_size,
+                            self.num_kv_heads,
+                            self.max_seq_len,
+                            self.head_dim,
+                        ),
+                        persistent=False,
+                    )
+                    self.register_buffer(
+                        "v_cache",
+                        torch.zeros(
+                            self.batch_size,
+                            self.num_kv_heads,
+                            self.max_seq_len,
+                            self.head_dim,
+                        ),
+                        persistent=False,
+                    )
             else:
-                # BHSD layout for SDPA / naive
-                self.register_buffer(
-                    "k_cache",
-                    torch.zeros(
-                        self.batch_size,
-                        self.num_kv_heads,
-                        self.max_seq_len,
-                        self.head_dim,
-                    ),
-                    persistent=False,
-                )
-                self.register_buffer(
-                    "v_cache",
-                    torch.zeros(
-                        self.batch_size,
-                        self.num_kv_heads,
-                        self.max_seq_len,
-                        self.head_dim,
-                    ),
-                    persistent=False,
-                )
+                self.k_cache = None
+                self.v_cache = None
         else:
-            # backend manages its own storage
             self.register_buffer("k_cache", None, persistent=False)
             self.register_buffer("v_cache", None, persistent=False)
 
-        # Buffers for CUDA Graph bucketing (always allocated; gated by use_cuda_graph_bucket).
         self.register_buffer(
             "_write_pos",
             torch.zeros(1, dtype=torch.long),
@@ -206,6 +207,29 @@ class Attention(nn.Module):
             q_bshd = q.transpose(1, 2)
             k_bshd = k.transpose(1, 2)
             v_bshd = v.transpose(1, 2)
+            if not self.preallocate_cache:
+                needed = cache_len + seq_len
+                if self.k_cache is None:
+                    self.k_cache = torch.zeros(
+                        self.batch_size,
+                        needed,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        dtype=k_bshd.dtype,
+                        device=k_bshd.device,
+                    )
+                    self.v_cache = torch.zeros(
+                        self.batch_size,
+                        needed,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        dtype=v_bshd.dtype,
+                        device=v_bshd.device,
+                    )
+                elif needed > self.k_cache.shape[1]:
+                    pad = needed - self.k_cache.shape[1]
+                    self.k_cache = F.pad(self.k_cache, (0, 0, 0, 0, 0, pad, 0, 0))
+                    self.v_cache = F.pad(self.v_cache, (0, 0, 0, 0, 0, pad, 0, 0))
             if is_prefill:
                 o = flash_attn_with_kvcache(
                     q_bshd,
@@ -232,8 +256,25 @@ class Attention(nn.Module):
             if self.kv_backend is not None:
                 self.kv_backend.update(k, v, cache_len, is_prefill=True)
             else:
-                self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
-                self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
+                if not self.preallocate_cache:
+                    if self.k_cache is None:
+                        self.k_cache = k.clone()
+                        self.v_cache = v.clone()
+                    else:
+                        needed = cache_len + seq_len
+                        if needed > self.k_cache.shape[2]:
+                            pad = needed - self.k_cache.shape[2]
+                            self.k_cache = F.pad(
+                                self.k_cache, (0, 0, 0, pad)
+                            )
+                            self.v_cache = F.pad(
+                                self.v_cache, (0, 0, 0, pad)
+                            )
+                        self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
+                        self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
+                else:
+                    self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
+                    self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
             k_for_attn = k
             v_for_attn = v
         else:
@@ -249,10 +290,29 @@ class Attention(nn.Module):
                 k_for_attn = self.k_cache
                 v_for_attn = self.v_cache
             else:
-                self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
-                self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
-                k_for_attn = self.k_cache[:, :, : cache_len + seq_len, :]
-                v_for_attn = self.v_cache[:, :, : cache_len + seq_len, :]
+                if not self.preallocate_cache:
+                    if self.k_cache is None:
+                        self.k_cache = k.clone()
+                        self.v_cache = v.clone()
+                    else:
+                        needed = cache_len + seq_len
+                        if needed > self.k_cache.shape[2]:
+                            pad = needed - self.k_cache.shape[2]
+                            self.k_cache = F.pad(
+                                self.k_cache, (0, 0, 0, pad)
+                            )
+                            self.v_cache = F.pad(
+                                self.v_cache, (0, 0, 0, pad)
+                            )
+                        self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
+                        self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
+                    k_for_attn = self.k_cache
+                    v_for_attn = self.v_cache
+                else:
+                    self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
+                    self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
+                    k_for_attn = self.k_cache[:, :, : cache_len + seq_len, :]
+                    v_for_attn = self.v_cache[:, :, : cache_len + seq_len, :]
 
         n_rep = self.num_heads // self.num_kv_heads
         if self.attention_backend == "sdpa":

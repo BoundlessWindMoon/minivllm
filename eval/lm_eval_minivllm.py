@@ -113,7 +113,11 @@ class MiniVLLM(TemplateLM):
     # Internal helpers
     # ------------------------------------------------------------------
     def _reset_kv_cache(self) -> None:
-        """Clear KV cache across all attention layers."""
+        """Clear KV cache and linear attention state across all layers."""
+        if hasattr(self.model, "reset"):
+            self.model.reset()
+            return
+        # Fallback for models without reset()
         layers = getattr(getattr(self.model, "model", None), "layers", None)
         if layers is None:
             return
@@ -121,9 +125,7 @@ class MiniVLLM(TemplateLM):
             attn = getattr(getattr(layer, "self_attn", None), "attn", None)
             if attn is None:
                 continue
-            if attn.kv_backend is not None:
-                attn.kv_backend.reset()
-            elif hasattr(attn, "k_cache") and attn.k_cache is not None:
+            if hasattr(attn, "k_cache") and attn.k_cache is not None:
                 attn.k_cache.zero_()
                 attn.v_cache.zero_()
 
