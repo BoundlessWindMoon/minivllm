@@ -8,6 +8,15 @@ A lightweight inference and quantization engine for studying LLMs.
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](#)
 </div>
 
+## Decode Throughput 
+
+> Measured on RTX 4050 6 GB · greedy · 128 decode tokens
+
+| Model | HF Transformers | mini-vllm | Speedup |
+|-------|----------------|-----------|---------|
+| Qwen3-0.6B | 23.0 tok/s | 114.5 tok/s (megakernel) | **5.0x** |
+| Qwen3.5-0.8B | 15.3 tok/s | 90.9 tok/s (CUDA Graph + flash-attn + fla) | **6.0x** |
+
 ## Streaming Inference & Megakernel 
 
 <div align="center">
