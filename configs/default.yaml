@@ -28,10 +28,7 @@ inference:
   attention_backend: sdpa
   stop_on_eos: true
   use_chat_template: true
-  # False = direct answer (faster, may be worse on hard problems). Ignored if use_chat_template=false.
   use_thinking: true
-  # Submodule paths to keep on CPU; pre/post forward hooks shuttle I/O across PCIe.
-  # Use this to fit large models on a small GPU. Set to [] to disable.
   cpu_offload_modules:
     []
     # - model.embed_tokens

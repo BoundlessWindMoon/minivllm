@@ -229,6 +229,10 @@ class Qwen3ForCausalLM(BaseCausalLM):
             if hasattr(layer.self_attn.attn, "_attn_mask"):
                 layer.self_attn.attn._attn_mask.fill_(float("-inf"))
 
+    def iter_attention_modules(self):
+        for layer in self.model.layers:
+            yield layer.self_attn.attn
+
     def _snapshot_cuda_graph_state(self):
         return [
             (layer.self_attn.attn.k_cache.clone(), layer.self_attn.attn.v_cache.clone())

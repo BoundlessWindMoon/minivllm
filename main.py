@@ -1,5 +1,3 @@
-"""Entry point: unified inference for fp16 / bf16 / quantized / megakernel."""
-
 import argparse
 
 import torch
@@ -9,6 +7,8 @@ from utils.logger import logger
 from utils.config import GlobalConfig, print_runtime_config
 from engine.model_runner import ModelRunner
 from engine.loader import load_model
+from engine.runtime_setup import apply_runtime_patches
+from engine.processor import load_processor
 
 
 def main():
@@ -29,7 +29,9 @@ def main():
 
     print_runtime_config(cfg)
 
-    model, tokenizer, processor = load_model(cfg)
+    model, tokenizer = load_model(cfg)
+    model = apply_runtime_patches(model, cfg)
+    processor = load_processor(cfg)
     runner = ModelRunner(model=model, tokenizer=tokenizer, processor=processor, cfg=cfg)
 
     text = runner.inference()

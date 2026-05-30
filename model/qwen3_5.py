@@ -605,6 +605,11 @@ class Qwen3_5ForCausalLM(BaseCausalLM):
                 if hasattr(layer.self_attn, "_attn_mask"):
                     layer.self_attn._attn_mask.fill_(float("-inf"))
 
+    def iter_attention_modules(self):
+        for layer in self.model.language_model.layers:
+            if hasattr(layer, "self_attn"):
+                yield layer.self_attn
+
     def _snapshot_cuda_graph_state(self):
         snaps = []
         for layer in self.model.language_model.layers:

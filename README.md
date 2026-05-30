@@ -10,7 +10,7 @@
 
 <br/>
 
-<img src="docs/perf_compare.gif" alt="mini-vllm megakernel vs HF Transformers — same Qwen3-0.6B, same prompt, ~8× faster" />
+<img src="assets/gifs/perf_compare.gif" alt="mini-vllm megakernel vs HF Transformers — same Qwen3-0.6B, same prompt, ~8× faster" />
 
 <sub>Qwen3-0.6B · bf16 · greedy · same prompt · 6 GB RTX 4050<br/>Left: HF Transformers · Right: mini-vllm megakernel</sub>
 

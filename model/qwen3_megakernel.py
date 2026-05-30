@@ -127,6 +127,9 @@ class Qwen3MegakernelForCausalLM(nn.Module):
         """Factory: wrap an already-loaded mini-vllm model."""
         return cls(model, max_seq_len=max_seq_len, variant=variant)
 
+    def iter_attention_modules(self):
+        yield from ()
+
     def reset(self):
         """Reset decode state and KV cache."""
         self._position = 0
