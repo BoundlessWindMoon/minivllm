@@ -14,6 +14,7 @@ from rich.live import Live
 from rich.console import Group, Console
 from rich.panel import Panel
 from rich.text import Text
+import time
 
 CONSOLE = Console()
 
@@ -35,12 +36,44 @@ class _StreamText:
 
 
 class _TokenThroughputColumn(ProgressColumn):
-    """tok/s 列"""
+    """tok/s 列（平均 + 瞬时）"""
 
     def render(self, task):
-        if task.elapsed and task.completed:
-            return f"{task.completed / task.elapsed:.1f} tok/s"
-        return ""
+        fixed = task.fields.get("fixed_throughput_str")
+        if fixed is not None:
+            return fixed
+
+        elapsed = task.elapsed
+        completed = task.completed
+        if not elapsed or not completed:
+            return ""
+
+        avg = completed / elapsed
+        timestamps = task.fields.get("decode_timestamps")
+        if timestamps and len(timestamps) >= 2:
+            now = time.time()
+            last_update = task.fields.get("inst_last_update", 0)
+
+            if now - last_update >= 1.0:
+                window_sec = 1.0
+                cutoff = timestamps[-1] - window_sec
+                start_idx = 0
+                for i, t in enumerate(timestamps):
+                    if t >= cutoff:
+                        start_idx = i
+                        break
+                count = len(timestamps) - start_idx
+                if count >= 2:
+                    duration = timestamps[-1] - timestamps[start_idx]
+                    if duration > 0:
+                        task.fields["last_instant"] = (count - 1) / duration
+                task.fields["inst_last_update"] = now
+
+            instant = task.fields.get("last_instant")
+            if instant is not None:
+                return f"avg {avg:.1f} inst {instant:.1f} tok/s"
+
+        return f"avg {avg:.1f} tok/s"
 
 
 class ModelLoadProgress:
@@ -151,9 +184,7 @@ class InferenceProgress:
         )
 
         self._prefill_task = None
-        self._warmup_task = self._progress.add_task(
-            "[yellow]Warmup", total=0, visible=False
-        )
+        self._warmup_task = None
         self._decode_task = None
 
     def start_prefill(self):
@@ -167,7 +198,12 @@ class InferenceProgress:
         self._generated_ids.append(tid)
         if self._enabled:
             assert self._prefill_task is not None  # 告诉类型检查器：这里绝不可能是 None
-            self._progress.update(self._prefill_task, total=1, completed=1)
+            self._progress.update(
+                self._prefill_task,
+                total=1,
+                completed=1,
+                fixed_throughput_str="",
+            )
             self._stream.generated = self._tokenizer.decode(
                 self._generated_ids, skip_special_tokens=True
             )
@@ -175,22 +211,27 @@ class InferenceProgress:
     def start_warmup(self, total: int):
         """开始 CUDA Graph warmup 阶段"""
         if self._enabled:
-            self._progress.update(self._warmup_task, total=total, visible=True)
+            self._warmup_task = self._progress.add_task("[yellow]Warmup", total=total)
 
     def step_warmup(self, n: int = 1):
         """warmup 进度前进"""
-        if self._enabled:
+        if self._enabled and self._warmup_task is not None:
             self._progress.update(self._warmup_task, advance=n)
-            self._live.refresh()
 
     def end_warmup(self):
         """warmup 完成"""
-        if self._enabled:
+        if self._enabled and self._warmup_task is not None:
             task = self._progress.tasks[self._warmup_task]
+            elapsed = task.elapsed
+            fixed_str = ""
+            if elapsed:
+                avg = task.completed / elapsed
+                fixed_str = f"avg {avg:.1f} tok/s"
             self._progress.update(
-                self._warmup_task, advance=task.total - task.completed
+                self._warmup_task,
+                advance=task.total - task.completed,
+                fixed_throughput_str=fixed_str,
             )
-            self._live.refresh()
 
     def start_decode(self):
         """开始 decode 阶段"""
@@ -206,6 +247,9 @@ class InferenceProgress:
             self._stream.generated = self._tokenizer.decode(
                 self._generated_ids, skip_special_tokens=True
             )
+            task = self._progress.tasks[self._decode_task]
+            timestamps = task.fields.setdefault("decode_timestamps", [])
+            timestamps.append(time.time())
             self._progress.update(self._decode_task, advance=1)
 
     def __enter__(self):
