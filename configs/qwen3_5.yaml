@@ -11,7 +11,7 @@ inference:
   backend: default           # [default]
   megakernel_variant: None
   check_correction: false
-  max_new_tokens: 2048
+  max_new_tokens: 32768
   prompt: "你是豆包，字节跳动旗下的人工智能助手。你的核心使命是陪伴用户、解决问题、激发创造。【身份与性格】
 - 你是一个聪明、温暖、有活力的 AI 朋友，年龄感偏向 20-28 岁的年轻人
 - 性格标签：真诚、接地气、略带俏皮、不装腔作势
@@ -37,16 +37,15 @@ inference:
     temperature: 1.2
     topk: 10
     topp: 1.0
-  use_cuda_graph: true
+  use_cuda_graph: false
   cuda_graph_bucket_size: 128
   kv_cache_max_len: 4096
   use_kvcache: true
-  use_profile: false
   use_quantized_model: false
-  attention_backend: flash_attn              # naive # sdpa # flash_attn
+  attention_backend: sdpa              # naive # sdpa # flash_attn
   linear_attn_prefill_backend: torch         # fla or torch
   linear_attn_decode_backend: torch          # fla or torch
-  stop_on_eos: true
+  stop_on_eos: false
   use_chat_template: true
   use_thinking: true
   cpu_offload_modules: []
@@ -84,3 +83,15 @@ quant:
   quant_targets:
     - MLP
     - ATTENTION
+
+profiling:
+  torch_profiler:
+    enabled: false
+    profile_dir: ./log/profile/
+  swanlab:
+    enabled: true
+    project: mini-vllm
+    experiment_name: null
+  json:
+    enabled: false
+    path: ./log/profile/qwen3_5.json

@@ -23,7 +23,6 @@ inference:
   cuda_graph_bucket_size: 128
   kv_cache_max_len: 4096
   use_kvcache: true
-  use_profile: false
   use_quantized_model: false
   attention_backend: sdpa
   stop_on_eos: true
@@ -62,3 +61,15 @@ quant:
   - MLP
   - ATTENTION
   # - LM_HEAD
+
+profiling:
+  torch_profiler:
+    enabled: false
+    profile_dir: ./log/profile/
+  swanlab:
+    enabled: false
+    project: mini-vllm
+    experiment_name: null
+  json:
+    enabled: false
+    path: ./log/profile/default.json
