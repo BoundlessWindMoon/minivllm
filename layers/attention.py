@@ -275,8 +275,13 @@ class Attention(nn.Module):
                 else:
                     self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
                     self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
-            k_for_attn = k
-            v_for_attn = v
+            # 增量 prefill: 需要读取全部 K/V (cached + new)
+            if cache_len > 0:
+                k_for_attn = self.k_cache[:, :, : cache_len + seq_len, :]
+                v_for_attn = self.v_cache[:, :, : cache_len + seq_len, :]
+            else:
+                k_for_attn = k
+                v_for_attn = v
         else:
             if self.kv_backend is not None:
                 self.kv_backend.update(k, v, cache_len, is_prefill=False)
@@ -320,9 +325,23 @@ class Attention(nn.Module):
                 k_for_attn = k_for_attn.repeat_interleave(n_rep, dim=1)
                 v_for_attn = v_for_attn.repeat_interleave(n_rep, dim=1)
             if is_prefill:
-                o = F.scaled_dot_product_attention(
-                    q, k_for_attn, v_for_attn, is_causal=True
-                )
+                if cache_len > 0:
+                    # 增量 prefill: Q 短 KV 长，手动构造 causal mask
+                    seq_len_q = q.shape[2]
+                    seq_len_k = k_for_attn.shape[2]
+                    mask = torch.full(
+                        (seq_len_q, seq_len_k), float("-inf"), device=q.device
+                    )
+                    for i in range(seq_len_q):
+                        mask[i, : cache_len + i + 1] = 0
+                    mask = mask.unsqueeze(0).unsqueeze(0)
+                    o = F.scaled_dot_product_attention(
+                        q, k_for_attn, v_for_attn, attn_mask=mask
+                    )
+                else:
+                    o = F.scaled_dot_product_attention(
+                        q, k_for_attn, v_for_attn, is_causal=True
+                    )
             else:
                 if self.use_cuda_graph_bucket:
                     o = F.scaled_dot_product_attention(

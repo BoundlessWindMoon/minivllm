@@ -1,23 +1,13 @@
-"""ModelRunner: orchestrates prefill, decode, CUDA graph, sampling, and verification."""
+"""ModelRunner: orchestrates prefill, decode, CUDA graph, and sampling."""
 
 import os
 import torch
-import warnings
 
 from utils.logger import logger
 from engine.context import get_context, set_context
-from engine.progress import InferenceProgress
+from engine.progress import InferenceProgress, _NoOpProgress
 from engine.profiler import build_profiler
 from engine.sampler import Sampler
-
-try:
-    from utils.verifier import Verifier
-
-    VERIFIER_AVAILABLE = True
-except:
-    VERIFIER_AVAILABLE = False
-    warnings.warn("Verifier is not available, some features may not work.")
-from typing import Optional
 from utils.config import GlobalConfig
 
 
@@ -36,7 +26,6 @@ class ModelRunner:
 
         self.device = cfg.env.device
         self.max_new_tokens = cfg.inference.max_new_tokens
-        self.check_correction = cfg.inference.check_correction
         self.use_kvcache = cfg.inference.use_kvcache
         self.stop_on_eos = getattr(cfg.inference, "stop_on_eos", True)
         self.eos_token_ids = self._collect_eos_ids() if self.stop_on_eos else set()
@@ -138,28 +127,6 @@ class ModelRunner:
             top_p=sampling_cfg.topp,
         )
 
-        if sampling_cfg.sample_method != "greedy":
-            self.check_correction = False
-            logger.warning(
-                "Only greedy sampling method supports correction, so correction is disabled."
-            )
-
-        self.verifier = None
-        self.verification_results = {}
-        if self.check_correction:
-            if not VERIFIER_AVAILABLE:
-                raise RuntimeError("Verifier is not available.")
-            if cfg.path.baseline_model_path is None:
-                raise ValueError(
-                    "baseline_model_path must be provided for verification"
-                )
-            self.verifier = Verifier(
-                baseline_model_path=cfg.path.baseline_model_path,
-                baseline_model_dtype=cfg.env.get_torch_dtype(),
-                tokenizer=tokenizer,
-                device=self.device,
-            )
-
         self.profiler = build_profiler(cfg)
         if not self.use_kvcache:
             logger.error(
@@ -239,129 +206,91 @@ class ModelRunner:
         )
 
     @torch.inference_mode()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        cached_len: int = 0,
+        max_new_tokens: int = None,
+        pbar=None,
+    ) -> torch.Tensor:
+        if pbar is None:
+            pbar = _NoOpProgress()
+
+        max_new_tokens = max_new_tokens or self.max_new_tokens
+        prompt_seq_len = input_ids.shape[1]
+        new_seq_len = prompt_seq_len - cached_len
+        past_len = prompt_seq_len
+        generated_ids = []
+
+        position_ids = torch.arange(
+            cached_len, prompt_seq_len, device=self.device
+        ).unsqueeze(0)
+
+        new_input_ids = input_ids[:, cached_len:]
+
+        # ==========================================
+        # 1. Prefill
+        # ==========================================
+        pbar.start_prefill()
+        cu_seqlens_q_prefill = torch.tensor(
+            [0, new_seq_len], dtype=torch.long, device=self.device
+        )
+        set_context(
+            is_prefill=True,
+            cache_len=cached_len,
+            cu_seqlens_q=cu_seqlens_q_prefill,
+        )
+        logits = self.run(new_input_ids, position_ids, **self._multimodal_kwargs)
+
+        next_token = self.sampler.sample(logits)
+        generated_ids.append(next_token.item())
+        pbar.end_prefill(next_token.item())
+
+        # ==========================================
+        # 2. Decode
+        # ==========================================
+        current_tokens = 0
+        stopped_by_eos = next_token.item() in self.eos_token_ids
+
+        if self.use_cuda_graph:
+            self._decode_input_ids.copy_(next_token.reshape(1, 1))
+
+            can_precapture = hasattr(self.model, "_snapshot_cuda_graph_state")
+            if can_precapture:
+                pbar.start_warmup(total=max_new_tokens + 2)
+                self._capture_all_decode_graphs(past_len, max_new_tokens, pbar)
+                pbar.end_warmup()
+
+        pbar.start_decode()
+        while current_tokens < max_new_tokens and not stopped_by_eos:
+            logits = self.run_decode(next_token, past_len)
+            next_token = self.sampler.sample(logits)
+            generated_ids.append(next_token.item())
+            past_len += 1
+            current_tokens += 1
+            pbar.step_decode(next_token.item())
+            if next_token.item() in self.eos_token_ids:
+                stopped_by_eos = True
+                break
+
+        return torch.tensor([generated_ids], device=self.device, dtype=torch.long)
+
+    @torch.inference_mode()
     def inference(self) -> str:
         max_new_tokens = self.max_new_tokens
         tokenizer = self.tokenizer
         input_ids = self.input_ids
-        position_ids = self.position_ids
         prompt_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
         with InferenceProgress(tokenizer, max_new_tokens, prompt_text) as pbar:
             with self.profiler.scope("decode"):
-                prompt_seq_len = input_ids.shape[1]
-                past_len = 0
-                generated_ids = []
-
-                # ==========================================
-                # 1. Prefill
-                # ==========================================
-                pbar.start_prefill()
-                cu_seqlens_q_prefill = torch.tensor(
-                    [0, prompt_seq_len], dtype=torch.long, device=self.device
+                output_ids = self.generate(
+                    input_ids,
+                    cached_len=0,
+                    max_new_tokens=max_new_tokens,
+                    pbar=pbar,
                 )
-                set_context(
-                    is_prefill=True,
-                    cache_len=past_len,
-                    cu_seqlens_q=cu_seqlens_q_prefill,
-                )
-                logits = self.run(input_ids, position_ids, **self._multimodal_kwargs)
+                generated_ids = output_ids[0].tolist()
 
-                if self.check_correction and self.verifier is not None:
-                    logger.info("[ModelRunner] 计算 baseline PPL...")
-                    self.verifier.compute_baseline_ppl(self.prompt)
-                    logger.info("[ModelRunner] 比对 baseline model PPL...")
-                    if logits.shape[1] == input_ids.shape[1]:
-                        ppl_result = self.verifier.verify_ppl(logits, input_ids)
-                        self.verification_results["ppl"] = ppl_result
-                    else:
-                        logger.warning(
-                            "模型在 Prefill 阶段仅返回了最后一个 token 的 logits, 无法计算 PPL。"
-                        )
-
-                next_token = self.sampler.sample(logits)
-
-                generated_ids.append(next_token.item())
-                past_len += prompt_seq_len
-                pbar.end_prefill(next_token.item())
-                # ==========================================
-                # 2. Decode
-                # ==========================================
-                if self.check_correction and self.verifier is not None:
-                    logger.info("[ModelRunner] 生成 baseline 的 greedy decode 结果...")
-                    self.verifier.generate_baseline_greedy(self.prompt, max_new_tokens)
-                    logger.info("[ModelRunner] 开始逐 Token 验证 Decode...")
-
-                current_tokens = 0
-                decode_pass = False
-                stopped_by_eos = next_token.item() in self.eos_token_ids
-
-                if self.use_cuda_graph:
-                    self._decode_input_ids.copy_(next_token.reshape(1, 1))
-                    pbar.start_warmup(total=max_new_tokens + 2)
-
-                    can_precapture = hasattr(self.model, "_snapshot_cuda_graph_state")
-                    if can_precapture:
-                        self._capture_all_decode_graphs(past_len, max_new_tokens, pbar)
-                    pbar.end_warmup()
-
-                pbar.start_decode()
-                ncu_decode = os.environ.get("MINI_VLLM_NCU_DECODE") == "1"
-                if ncu_decode:
-                    torch.cuda.synchronize()
-                    torch.cuda.cudart().cudaProfilerStart()
-                while current_tokens < max_new_tokens and not stopped_by_eos:
-                    with self.profiler.step(step=current_tokens):
-                        logits = self.run_decode(next_token, past_len)
-
-                    next_token = self.sampler.sample(logits)
-                    if (
-                        self.check_correction
-                        and self.verifier is not None
-                        and not decode_pass
-                    ):
-                        is_match, details = self.verifier.verify_decode_step(
-                            logits[:, -1, :], next_token.squeeze(), current_tokens + 1
-                        )
-
-                        if not is_match:
-                            if details["max_prob_diff"] < 0.1:
-                                logger.warning(
-                                    f"\n[Warning] Step {current_tokens}: baseline 选 '{details['baseline_text']}'({details['prob_baseline_tok_in_baseline']:.4f}), "
-                                    f"\ncustom 选 '{details['test_text']}'({details['prob_test_tok_in_test']:.4f})"
-                                    f"\nTop-K 分布一致，视为浮点精度问题, Decode 验证通过！"
-                                )
-
-                                details["is_match"] = True
-                                self.verification_results["decode_diverge"] = details
-                                decode_pass = True
-                            else:
-                                logger.error(
-                                    f"\n[fatal error] Step {current_tokens}: Token 严重发散！最大概率差: {details['max_prob_diff']:.4f}"
-                                )
-                                self.verification_results["decode_diverge"] = details
-                                self.verifier.print_verification_report(
-                                    self.verification_results
-                                )
-                                break
-                    generated_ids.append(next_token.item())
-                    past_len += 1
-                    current_tokens += 1
-                    pbar.step_decode(next_token.item())
-                    if next_token.item() in self.eos_token_ids:
-                        stopped_by_eos = True
-                        break
-
-                if ncu_decode:
-                    torch.cuda.synchronize()
-                    torch.cuda.cudart().cudaProfilerStop()
-
-                if (
-                    (current_tokens == max_new_tokens or stopped_by_eos)
-                    and self.check_correction
-                    and self.verifier is not None
-                ):
-                    if "decode_diverge" not in self.verification_results:
-                        self.verification_results["decode_diverge"] = {"is_match": True}
-                    self.verifier.print_verification_report(self.verification_results)
         text = tokenizer.decode(
             input_ids[0], skip_special_tokens=True
         ) + tokenizer.decode(generated_ids, skip_special_tokens=True)

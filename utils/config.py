@@ -33,7 +33,6 @@ class EnvironmentConfig:
 @dataclass
 class PathConfig:
     model_path: str = "~/huggingface/Qwen3-0.6B/"
-    baseline_model_path: str = "~/huggingface/baseline/"
     data_path: str = ""
     profile_dir: str = "./log/profile/"
     quantized_model_path: str = ""
@@ -41,8 +40,6 @@ class PathConfig:
     def __post_init__(self):
         if self.model_path:
             self.model_path = os.path.expanduser(self.model_path)
-        if self.baseline_model_path:
-            self.baseline_model_path = os.path.expanduser(self.baseline_model_path)
         if self.data_path:
             self.data_path = os.path.expanduser(self.data_path)
         if self.profile_dir:
@@ -111,7 +108,6 @@ class InferenceConfig:
     attention_backend: str = "sdpa"  # [flash_attn, sdpa, naive]
     use_cuda_graph: bool = True
     cuda_graph_bucket_size: int = 1
-    check_correction: bool = False
     use_profile: bool = False
     backend: str = "default"
     megakernel_variant: str = "default"
