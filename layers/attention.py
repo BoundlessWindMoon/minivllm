@@ -166,6 +166,189 @@ class Attention(nn.Module):
             persistent=False,
         )
 
+    def _store_kv(self, k, v, cache_len, seq_len, is_prefill):
+        """Store new key/value tensors into the KV cache.
+
+        Handles all write paths: custom kv_backend, CUDA-graph scatter,
+        dense pre-allocated cache, and dense dynamic cache.
+
+        Args:
+            k (torch.Tensor): Key tensor, shape (B, num_kv_heads, seq_len, head_dim).
+            v (torch.Tensor): Value tensor, shape (B, num_kv_heads, seq_len, head_dim).
+            cache_len (int): Number of tokens already cached before this write.
+            seq_len (int): Number of new tokens in *k* and *v*.
+            is_prefill (bool): True during prefill; False during decode.
+
+        Returns:
+            None
+        """
+        if is_prefill:
+            if self.kv_backend is not None:
+                self.kv_backend.store_kv(k, v, cache_len, is_prefill=True)
+                return
+
+            if not self.preallocate_cache:
+                if self.k_cache is None:
+                    self.k_cache = k.clone()
+                    self.v_cache = v.clone()
+                    return
+                needed = cache_len + seq_len
+                if needed > self.k_cache.shape[2]:
+                    pad = needed - self.k_cache.shape[2]
+                    self.k_cache = F.pad(self.k_cache, (0, 0, 0, pad))
+                    self.v_cache = F.pad(self.v_cache, (0, 0, 0, pad))
+            self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
+            self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
+        else:
+            if self.kv_backend is not None:
+                self.kv_backend.store_kv(k, v, cache_len, is_prefill=False)
+            elif self.use_cuda_graph_bucket:
+                write_idx = self._write_pos.view(1, 1, 1, 1).expand(
+                    k.shape[0], self.num_kv_heads, seq_len, self.head_dim
+                )
+                self.k_cache.scatter_(2, write_idx, k)
+                self.v_cache.scatter_(2, write_idx, v)
+            else:
+                if not self.preallocate_cache:
+                    if self.k_cache is None:
+                        self.k_cache = k.clone()
+                        self.v_cache = v.clone()
+                    else:
+                        needed = cache_len + seq_len
+                        if needed > self.k_cache.shape[2]:
+                            pad = needed - self.k_cache.shape[2]
+                            self.k_cache = F.pad(self.k_cache, (0, 0, 0, pad))
+                            self.v_cache = F.pad(self.v_cache, (0, 0, 0, pad))
+                        self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
+                        self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
+                else:
+                    self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
+                    self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
+
+    def _load_kv(self, total_len, is_prefill, k_input, v_input):
+        """Retrieve key/value tensors from the cache for attention computation.
+
+        Handles all read paths: custom kv_backend, CUDA-graph full cache,
+        dense pre-allocated cache (sliced), and dense dynamic cache.
+
+        Args:
+            total_len (int): Total sequence length to retrieve (cache_len + seq_len).
+            is_prefill (bool): True during prefill; False during decode.
+            k_input (torch.Tensor): Input key tensor, shape (B, num_kv_heads, seq_len, head_dim).
+            v_input (torch.Tensor): Input value tensor, shape (B, num_kv_heads, seq_len, head_dim).
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - k: shape (B, num_kv_heads, total_len, head_dim)
+                - v: shape (B, num_kv_heads, total_len, head_dim)
+        """
+        if self.kv_backend is not None:
+            return self.kv_backend.load_kv(total_len)
+
+        if is_prefill:
+            if total_len > k_input.shape[2]:
+                return (
+                    self.k_cache[:, :, :total_len, :],
+                    self.v_cache[:, :, :total_len, :],
+                )
+            return k_input, v_input
+        else:
+            if self.use_cuda_graph_bucket or not self.preallocate_cache:
+                return self.k_cache, self.v_cache
+            return (
+                self.k_cache[:, :, :total_len, :],
+                self.v_cache[:, :, :total_len, :],
+            )
+
+    def _compute_kivi_decode(self, q):
+        """Decode-phase attention using the fused KIVI Triton kernel.
+
+        Replaces the previous 7-kernel path with a 2-kernel fused path:
+        per-tile partial attention + cross-tile reduction.
+
+        Args:
+            q (torch.Tensor): Query tensor, shape (B, num_heads, 1, head_dim).
+
+        Returns:
+            torch.Tensor: Attention output, shape (B, num_heads, 1, head_dim).
+        """
+        from kernels.kivi.fused_attention import kivi_fused_decode_attention
+
+        backend = self.kv_backend
+        k_code, k_scale, k_mn, k_full, v_code, v_scale, v_mn, v_full = (
+            backend.get_quantized_state()
+        )
+
+        return kivi_fused_decode_attention(
+            q,
+            k_code, k_scale, k_mn, k_full,
+            v_code, v_scale, v_mn, v_full,
+            scale=self.scale,
+            group_size=backend.group_size,
+            k_bits=backend.k_bits,
+            v_bits=backend.v_bits,
+        )
+
+    def _compute(self, q, k, v, is_prefill, cache_len):
+        """Compute scaled dot-product attention over q, k, v.
+
+        Supports both SDPA and naive manual matmul paths.
+        Handles GQA head replication, causal masking for prefill, and bucket
+        masking for CUDA-graph decode.
+
+        Args:
+            q (torch.Tensor): Query tensor, shape (B, num_heads, seq_len_q, head_dim).
+            k (torch.Tensor): Key tensor, shape (B, num_kv_heads, seq_len_k, head_dim).
+            v (torch.Tensor): Value tensor, shape (B, num_kv_heads, seq_len_k, head_dim).
+            is_prefill (bool): True during prefill; False during decode.
+            cache_len (int): Number of previously cached tokens.
+
+        Returns:
+            torch.Tensor: Attention output, shape (B, num_heads, seq_len_q, head_dim).
+        """
+        n_rep = self.num_heads // self.num_kv_heads
+        if n_rep > 1:
+            k = k.repeat_interleave(n_rep, dim=1)
+            v = v.repeat_interleave(n_rep, dim=1)
+
+        if self.attention_backend == "sdpa":
+            if is_prefill:
+                if cache_len > 0:
+                    seq_len_q = q.shape[2]
+                    seq_len_k = k.shape[2]
+                    # Vectorized causal mask: position (i, j) is visible when j <= cache_len + i
+                    q_pos = torch.arange(seq_len_q, device=q.device).unsqueeze(1)
+                    k_pos = torch.arange(seq_len_k, device=q.device).unsqueeze(0)
+                    mask = torch.where(k_pos <= cache_len + q_pos, 0.0, float("-inf"))
+                    mask = mask.unsqueeze(0).unsqueeze(0)
+                    o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+                else:
+                    o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            else:
+                if self.use_cuda_graph_bucket:
+                    o = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=self._attn_mask, is_causal=False
+                    )
+                else:
+                    o = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        else:
+            # naive
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+            seq_len_q = q.shape[2]
+            if is_prefill:
+                seq_len_k = k.shape[2]
+                causal_mask = torch.triu(
+                    torch.ones(seq_len_q, seq_len_k, device=q.device, dtype=torch.bool),
+                    diagonal=seq_len_k - seq_len_q + 1,
+                )
+                attn_weights = attn_weights.masked_fill(causal_mask, float("-inf"))
+            elif self.use_cuda_graph_bucket:
+                attn_weights = attn_weights + self._attn_mask
+            attn_weights = torch.softmax(attn_weights, dim=-1)
+            o = torch.matmul(attn_weights, v)
+
+        return o
+
     def forward(
         self,
         q: torch.Tensor,
@@ -201,7 +384,6 @@ class Attention(nn.Module):
         v = v.transpose(1, 2)
 
         seq_len = q.shape[2]
-        batch_size = q.shape[0]
 
         if self.attention_backend == "flash_attn":
             q_bshd = q.transpose(1, 2)
@@ -252,129 +434,17 @@ class Attention(nn.Module):
                 )
             return o
 
-        if is_prefill:
-            if self.kv_backend is not None:
-                self.kv_backend.update(k, v, cache_len, is_prefill=True)
-            else:
-                if not self.preallocate_cache:
-                    if self.k_cache is None:
-                        self.k_cache = k.clone()
-                        self.v_cache = v.clone()
-                    else:
-                        needed = cache_len + seq_len
-                        if needed > self.k_cache.shape[2]:
-                            pad = needed - self.k_cache.shape[2]
-                            self.k_cache = F.pad(
-                                self.k_cache, (0, 0, 0, pad)
-                            )
-                            self.v_cache = F.pad(
-                                self.v_cache, (0, 0, 0, pad)
-                            )
-                        self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
-                        self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
-                else:
-                    self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
-                    self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
-            # 增量 prefill: 需要读取全部 K/V (cached + new)
-            if cache_len > 0:
-                k_for_attn = self.k_cache[:, :, : cache_len + seq_len, :]
-                v_for_attn = self.v_cache[:, :, : cache_len + seq_len, :]
-            else:
-                k_for_attn = k
-                v_for_attn = v
+        self._store_kv(k, v, cache_len, seq_len, is_prefill)
+        if (
+            not is_prefill
+            and self.kv_backend is not None
+            and hasattr(self.kv_backend, "get_quantized_state")
+        ):
+            o = self._compute_kivi_decode(q)
         else:
-            if self.kv_backend is not None:
-                self.kv_backend.update(k, v, cache_len, is_prefill=False)
-                k_for_attn, v_for_attn = self.kv_backend.get_kv(cache_len + seq_len)
-            elif self.use_cuda_graph_bucket:
-                write_idx = self._write_pos.view(1, 1, 1, 1).expand(
-                    batch_size, self.num_kv_heads, seq_len, self.head_dim
-                )
-                self.k_cache.scatter_(2, write_idx, k)
-                self.v_cache.scatter_(2, write_idx, v)
-                k_for_attn = self.k_cache
-                v_for_attn = self.v_cache
-            else:
-                if not self.preallocate_cache:
-                    if self.k_cache is None:
-                        self.k_cache = k.clone()
-                        self.v_cache = v.clone()
-                    else:
-                        needed = cache_len + seq_len
-                        if needed > self.k_cache.shape[2]:
-                            pad = needed - self.k_cache.shape[2]
-                            self.k_cache = F.pad(
-                                self.k_cache, (0, 0, 0, pad)
-                            )
-                            self.v_cache = F.pad(
-                                self.v_cache, (0, 0, 0, pad)
-                            )
-                        self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
-                        self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
-                    k_for_attn = self.k_cache
-                    v_for_attn = self.v_cache
-                else:
-                    self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
-                    self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
-                    k_for_attn = self.k_cache[:, :, : cache_len + seq_len, :]
-                    v_for_attn = self.v_cache[:, :, : cache_len + seq_len, :]
-
-        n_rep = self.num_heads // self.num_kv_heads
-        if self.attention_backend == "sdpa":
-            if n_rep > 1:
-                k_for_attn = k_for_attn.repeat_interleave(n_rep, dim=1)
-                v_for_attn = v_for_attn.repeat_interleave(n_rep, dim=1)
-            if is_prefill:
-                if cache_len > 0:
-                    # 增量 prefill: Q 短 KV 长，手动构造 causal mask
-                    seq_len_q = q.shape[2]
-                    seq_len_k = k_for_attn.shape[2]
-                    mask = torch.full(
-                        (seq_len_q, seq_len_k), float("-inf"), device=q.device
-                    )
-                    for i in range(seq_len_q):
-                        mask[i, : cache_len + i + 1] = 0
-                    mask = mask.unsqueeze(0).unsqueeze(0)
-                    o = F.scaled_dot_product_attention(
-                        q, k_for_attn, v_for_attn, attn_mask=mask
-                    )
-                else:
-                    o = F.scaled_dot_product_attention(
-                        q, k_for_attn, v_for_attn, is_causal=True
-                    )
-            else:
-                if self.use_cuda_graph_bucket:
-                    o = F.scaled_dot_product_attention(
-                        q,
-                        k_for_attn,
-                        v_for_attn,
-                        attn_mask=self._attn_mask,
-                        is_causal=False,
-                    )
-                else:
-                    o = F.scaled_dot_product_attention(
-                        q, k_for_attn, v_for_attn, is_causal=False
-                    )
-        else:
-            # naive
-            if n_rep > 1:
-                k_for_attn = k_for_attn.repeat_interleave(n_rep, dim=1)
-                v_for_attn = v_for_attn.repeat_interleave(n_rep, dim=1)
-
-            attn_weights = torch.matmul(q, k_for_attn.transpose(-2, -1)) * self.scale
-
-            seq_len_q = q.shape[2]
-            if is_prefill:
-                seq_len_k = k_for_attn.shape[2]
-                causal_mask = torch.triu(
-                    torch.ones(seq_len_q, seq_len_k, device=q.device, dtype=torch.bool),
-                    diagonal=seq_len_k - seq_len_q + 1,
-                )
-                attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
-            elif self.use_cuda_graph_bucket:
-                attn_weights = attn_weights + self._attn_mask
-            attn_weights = torch.softmax(attn_weights, dim=-1)
-            o = torch.matmul(attn_weights, v_for_attn)
+            total_len = cache_len + seq_len
+            k_for_attn, v_for_attn = self._load_kv(total_len, is_prefill, k, v)
+            o = self._compute(q, k_for_attn, v_for_attn, is_prefill, cache_len)
 
         o = o.transpose(1, 2)
         return o

@@ -146,11 +146,12 @@ class ModelRunner:
         for attn_module in self.model.iter_attention_modules():
             if not getattr(attn_module, "use_cuda_graph_bucket", False):
                 continue
-            if hasattr(attn_module, "_write_pos"):
-                attn_module._write_pos[0] = past_len
-            if hasattr(attn_module, "_attn_mask"):
-                attn_module._attn_mask.fill_(float("-inf"))
-                attn_module._attn_mask[..., :seq_len] = 0
+            inner_attn = getattr(attn_module, "attn", attn_module)
+            if hasattr(inner_attn, "_write_pos"):
+                inner_attn._write_pos[0] = past_len
+            if hasattr(inner_attn, "_attn_mask"):
+                inner_attn._attn_mask.fill_(float("-inf"))
+                inner_attn._attn_mask[..., :seq_len] = 0
 
     def _prepare_multimodal_inputs(self, multimodal_cfg, use_thinking: bool):
         from PIL import Image

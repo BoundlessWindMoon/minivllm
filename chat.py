@@ -45,10 +45,12 @@ def reset_kv_cache(model) -> None:
     """Zero out all attention KV caches and reset model decode state."""
     if hasattr(model, "iter_attention_modules"):
         for attn in model.iter_attention_modules():
-            if hasattr(attn, "k_cache") and attn.k_cache is not None:
-                attn.k_cache.zero_()
-            if hasattr(attn, "v_cache") and attn.v_cache is not None:
-                attn.v_cache.zero_()
+            inner = getattr(attn, "attn", attn)
+            if getattr(inner, "kv_backend", None) is not None:
+                inner.kv_backend.reset()
+            elif hasattr(inner, "k_cache") and inner.k_cache is not None:
+                inner.k_cache.zero_()
+                inner.v_cache.zero_()
     if hasattr(model, "reset"):
         model.reset()
 

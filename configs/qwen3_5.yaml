@@ -54,7 +54,11 @@ inference:
     image_path: assets/images/cute_cat.jpg
     enable_thinking: true
   kv_cache:
-    backend: None
+    backend: kivi
+    k_bits: 2                                                                                                                                                                                                    
+    v_bits: 2                                                                                                                                                                                                    
+    group_size: 32                                                                                                                                                                                               
+    residual_length: 32
 
 path:
   baseline_model_path: ~/huggingface/baseline/
