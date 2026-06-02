@@ -23,17 +23,19 @@ def quantize_and_pack_kcache(k: torch.FloatTensor, group_size: int, bits: int):
         mn:     (B, nh, T // group_size, D)
     """
     assert len(k.shape) == 4
-    assert bits in (2, 4)
+    assert bits in (2, 4), f"Only 2-bit and 4-bit are supported, got {bits}"
     B, nh, T, D = k.shape
     assert T % group_size == 0, f"T={T} must be divisible by group_size={group_size}"
     num_groups = T // group_size
     new_shape = (B, nh, num_groups, group_size, D)
 
-    max_int = 2 ** bits - 1
+    max_int = 2**bits - 1
     data = k.view(new_shape)
     mn = torch.min(data, dim=-2, keepdim=True)[0]
     mx = torch.max(data, dim=-2, keepdim=True)[0]
     scale = (mx - mn) / max_int
+    # Guard against division by zero when all values in a group are identical.
+    scale.clamp_(min=1e-6)
 
     data = data - mn
     data.div_(scale)
@@ -57,17 +59,19 @@ def quantize_and_pack_vcache(v: torch.FloatTensor, group_size: int, bits: int):
         mn:     (B, nh, T, D // group_size)
     """
     assert len(v.shape) == 4
-    assert bits in (2, 4)
+    assert bits in (2, 4), f"Only 2-bit and 4-bit are supported, got {bits}"
     B, nh, T, D = v.shape
     assert D % group_size == 0, f"D={D} must be divisible by group_size={group_size}"
     num_groups = D // group_size
     new_shape = (B, nh, T, num_groups, group_size)
 
-    max_int = 2 ** bits - 1
+    max_int = 2**bits - 1
     data = v.view(new_shape)
     mn = torch.min(data, dim=-1, keepdim=True)[0]
     mx = torch.max(data, dim=-1, keepdim=True)[0]
     scale = (mx - mn) / max_int
+    # Guard against division by zero when all values in a group are identical.
+    scale.clamp_(min=1e-6)
 
     data = data - mn
     data.div_(scale)
@@ -96,7 +100,7 @@ def unpack_and_dequant_kcache(
     Returns:
         (B, nh, T, D) of *out_dtype*
     """
-    assert bits in (2, 4)
+    assert bits in (2, 4), f"Only 2-bit and 4-bit are supported, got {bits}"
     assert len(k_code.shape) == 4
     data = unpack_tensor(k_code, bits, pack_dim=2)
     shape = data.shape
@@ -126,7 +130,7 @@ def unpack_and_dequant_vcache(
     Returns:
         (B, nh, T, D) of *out_dtype*
     """
-    assert bits in (2, 4)
+    assert bits in (2, 4), f"Only 2-bit and 4-bit are supported, got {bits}"
     assert len(v_code.shape) == 4
     data = unpack_tensor(v_code, bits, pack_dim=3)
     shape = data.shape
@@ -141,8 +145,11 @@ def unpack_and_dequant_vcache(
 # Bit packing helpers
 # ---------------------------------------------------------------------------
 
+
 def pack_tensor(data: torch.Tensor, bits: int, pack_dim: int):
     """Pack int32 values (0..2**bits-1) into 32-bit integers.
+
+    Vectorised: single CUDA kernel launch instead of a Python loop.
 
     Args:
         data: int32 tensor, the dimension *pack_dim* must be divisible by
@@ -155,35 +162,37 @@ def pack_tensor(data: torch.Tensor, bits: int, pack_dim: int):
     """
     shape = data.shape
     feat_per_int = 32 // bits
-    assert bits in (2, 4), "Only 2, 4 bits supported"
-    assert shape[pack_dim] % feat_per_int == 0, (
-        f"dim {pack_dim} ({shape[pack_dim]}) must be divisible by {feat_per_int}"
-    )
+    assert bits in (2, 4), "Only 2-bit and 4-bit are supported"
+    assert (
+        shape[pack_dim] % feat_per_int == 0
+    ), f"dim {pack_dim} ({shape[pack_dim]}) must be divisible by {feat_per_int}"
 
-    new_shape = (
-        shape[:pack_dim]
-        + (shape[pack_dim] // feat_per_int,)
-        + shape[pack_dim + 1 :]
-    )
-    code = torch.zeros(new_shape, dtype=torch.int32, device=data.device)
+    # Build shift tensor: [0, bits, 2*bits, ..., (feat_per_int-1)*bits]
+    shifts = torch.arange(feat_per_int, device=data.device, dtype=torch.int32) * bits
 
-    unpacked_indices = [slice(None)] * len(data.shape)
-    packed_indices = [slice(None)] * len(new_shape)
+    # Reshape so that the pack dimension becomes (packed_len, feat_per_int)
+    packed_len = shape[pack_dim] // feat_per_int
+    new_shape = list(shape)
+    new_shape[pack_dim] = packed_len
+    new_shape.insert(pack_dim + 1, feat_per_int)
+    data_reshaped = data.view(new_shape)
 
-    row = 0
-    i = 0
-    while row < code.shape[pack_dim]:
-        packed_indices[pack_dim] = row
-        for j in range(i, i + feat_per_int):
-            unpacked_indices[pack_dim] = j
-            code[tuple(packed_indices)] |= data[tuple(unpacked_indices)] << (bits * (j - i))
-        i += feat_per_int
-        row += 1
+    # Reshape shifts for broadcasting along the feat_per_int dimension
+    shift_shape = [1] * len(new_shape)
+    shift_shape[pack_dim + 1] = feat_per_int
+    shifts = shifts.view(shift_shape)
+
+    # Shift each slice and sum to pack
+    # data_reshaped: (..., packed_len, feat_per_int, ...)
+    # We want to sum over the feat_per_int dimension
+    code = (data_reshaped * (1 << shifts)).sum(dim=pack_dim + 1, dtype=torch.int32)
     return code
 
 
 def unpack_tensor(v_code: torch.Tensor, bits: int, pack_dim: int):
     """Unpack 32-bit integers into int8 values.
+
+    Vectorised: single CUDA kernel launch.
 
     Args:
         v_code: int32 tensor
@@ -193,27 +202,27 @@ def unpack_tensor(v_code: torch.Tensor, bits: int, pack_dim: int):
     Returns:
         int8 tensor with *pack_dim* expanded by feat_per_int.
     """
-    assert bits in (2, 4)
+    assert bits in (2, 4), "Only 2-bit and 4-bit are supported"
     shape = v_code.shape
     feat_per_int = 32 // bits
-    new_shape = (
-        shape[:pack_dim]
-        + (shape[pack_dim] * feat_per_int,)
-        + shape[pack_dim + 1 :]
-    )
-    unpacked = torch.zeros(new_shape, dtype=torch.int8, device=v_code.device)
+    num = (1 << bits) - 1
 
-    i = torch.arange(new_shape[pack_dim], device=v_code.device) // feat_per_int
-    j = torch.arange(new_shape[pack_dim], device=v_code.device) % feat_per_int
-    num = 0xFF >> (8 - bits)
+    # Expand the pack dimension: (..., packed_len, ...) -> (..., packed_len, 1, ...)
+    expand_shape = list(shape)
+    expand_shape.insert(pack_dim + 1, 1)
+    code_expanded = v_code.view(expand_shape)
 
-    packed_indices = [slice(None)] * len(new_shape)
-    packed_indices[pack_dim] = i
+    # Create shifts: [0, bits, 2*bits, ...]
+    shifts = torch.arange(feat_per_int, device=v_code.device, dtype=torch.int32) * bits
+    # Reshape shifts for broadcasting: e.g. (1, 1, feat_per_int, 1) when pack_dim=2
+    shift_shape = [1] * (len(expand_shape))
+    shift_shape[pack_dim + 1] = feat_per_int
+    shifts = shifts.view(shift_shape)
 
-    if pack_dim == 2:
-        unpacked = ((v_code[tuple(packed_indices)] >> (j * bits)[None, None, :, None]).to(torch.int16)) & num
-    elif pack_dim == 3:
-        unpacked = ((v_code[tuple(packed_indices)] >> (j * bits)).to(torch.int16)) & num
-    else:
-        raise NotImplementedError(f"pack_dim={pack_dim} not supported")
-    return unpacked
+    # Unpack: (code >> shift) & mask
+    unpacked = ((code_expanded >> shifts) & num).to(torch.int8)
+
+    # Collapse the packed dimension back
+    final_shape = list(shape)
+    final_shape[pack_dim] = final_shape[pack_dim] * feat_per_int
+    return unpacked.view(final_shape)

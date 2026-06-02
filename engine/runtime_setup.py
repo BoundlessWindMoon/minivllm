@@ -26,19 +26,29 @@ def apply_runtime_patches(model, cfg):
             logger.info("Megakernel: enabled greedy fast path (kernel argmax only)")
 
     # Inject KV-cache backend if requested
-    if (
-        getattr(cfg.inference, "kv_cache", None)
-        and cfg.inference.kv_cache.backend == "kivi"
-    ):
-        from layers.kv_cache import KiviKVCacheBackend
+    kv_cfg = getattr(cfg.inference, "kv_cache", None)
+    if kv_cfg and kv_cfg.backend in ("kivi", "default"):
+        from layers.kv_cache import create_kv_backend
 
-        kv_cfg = cfg.inference.kv_cache
+        def _find_kv_backend_module(module, depth=0):
+            """Recursively find the first submodule that has a kv_backend attr."""
+            if depth > 3:
+                return None
+            if hasattr(module, "kv_backend"):
+                return module
+            for child in module.children():
+                found = _find_kv_backend_module(child, depth + 1)
+                if found is not None:
+                    return found
+            return None
+
         layers = getattr(getattr(model, "model", None), "layers", None)
         if layers is not None:
             for layer in layers:
-                attn_module = getattr(getattr(layer, "self_attn", None), "attn", None)
-                if attn_module is not None and hasattr(attn_module, "kv_backend"):
-                    attn_module.kv_backend = KiviKVCacheBackend(
+                attn_module = _find_kv_backend_module(layer)
+                if attn_module is not None:
+                    attn_module.kv_backend = create_kv_backend(
+                        backend=kv_cfg.backend,
                         batch_size=1,
                         num_kv_heads=attn_module.num_kv_heads,
                         max_seq_len=attn_module.max_seq_len,
@@ -50,10 +60,13 @@ def apply_runtime_patches(model, cfg):
                         device=cfg.env.device,
                         dtype=cfg.env.get_torch_dtype(),
                     )
-            logger.info(
-                f"[KVCache] Injected KiviKVCacheBackend "
-                f"(k_bits={kv_cfg.k_bits}, v_bits={kv_cfg.v_bits}, "
-                f"group_size={kv_cfg.group_size}, residual={kv_cfg.residual_length})"
-            )
+            if kv_cfg.backend == "kivi":
+                logger.info(
+                    f"[KVCache] Injected KiviKVCacheBackend "
+                    f"(k_bits={kv_cfg.k_bits}, v_bits={kv_cfg.v_bits}, "
+                    f"group_size={kv_cfg.group_size}, residual={kv_cfg.residual_length})"
+                )
+            else:
+                logger.info("[KVCache] Using default dense FP16/BF16 cache.")
 
     return model

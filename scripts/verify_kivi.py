@@ -56,11 +56,12 @@ def greedy_decode(model, tokenizer, prompt: str, max_tokens: int, device: str):
 def reset_kv_cache(model):
     """Zero out or reset all KV cache backends."""
     for attn_module in model.iter_attention_modules():
-        if getattr(attn_module, "kv_backend", None) is not None:
-            attn_module.kv_backend.reset()
-        elif hasattr(attn_module, "k_cache") and attn_module.k_cache is not None:
-            attn_module.k_cache.zero_()
-            attn_module.v_cache.zero_()
+        inner = getattr(attn_module, "attn", attn_module)
+        if getattr(inner, "kv_backend", None) is not None:
+            inner.kv_backend.reset()
+        elif hasattr(inner, "k_cache") and inner.k_cache is not None:
+            inner.k_cache.zero_()
+            inner.v_cache.zero_()
 
 
 def main():
