@@ -11,10 +11,10 @@ from typing import Tuple
 
 import torch
 
-
 # ---------------------------------------------------------------------------
 # Abstract interface
 # ---------------------------------------------------------------------------
+
 
 class KVCacheBackend(ABC):
     """Abstract interface for KV cache storage and retrieval."""
@@ -62,6 +62,7 @@ class KVCacheBackend(ABC):
 # Default dense cache
 # ---------------------------------------------------------------------------
 
+
 class DefaultKVCacheBackend(KVCacheBackend):
     """Standard dense FP16/BF16 KV cache."""
 
@@ -82,12 +83,20 @@ class DefaultKVCacheBackend(KVCacheBackend):
         self._dtype = dtype
 
         self.k_cache = torch.zeros(
-            batch_size, num_kv_heads, max_seq_len, head_dim,
-            dtype=dtype, device=device,
+            batch_size,
+            num_kv_heads,
+            max_seq_len,
+            head_dim,
+            dtype=dtype,
+            device=device,
         )
         self.v_cache = torch.zeros(
-            batch_size, num_kv_heads, max_seq_len, head_dim,
-            dtype=dtype, device=device,
+            batch_size,
+            num_kv_heads,
+            max_seq_len,
+            head_dim,
+            dtype=dtype,
+            device=device,
         )
 
     @property
@@ -99,7 +108,7 @@ class DefaultKVCacheBackend(KVCacheBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         cache_len: int,
-        _is_prefill: bool,
+        is_prefill: bool,
     ) -> None:
         seq_len = k.shape[2]
         self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
@@ -119,6 +128,7 @@ class DefaultKVCacheBackend(KVCacheBackend):
 # ---------------------------------------------------------------------------
 # KIVI quantized cache
 # ---------------------------------------------------------------------------
+
 
 class KiviKVCacheBackend(KVCacheBackend):
     """KIVI-style asymmetric grouped KV cache quantization.
@@ -171,34 +181,44 @@ class KiviKVCacheBackend(KVCacheBackend):
         # _k_quant_cache: packed int32 codes, shape (B, nh, T//k_feat_per_int, D)
         # _k_scale_cache: per-group scale, shape (B, nh, T//group_size, D)
         # _k_mn_cache: per-group min, shape (B, nh, T//group_size, D)
-        # _k_deq_cache: dequantized buffer for fallback attention path
         # _k_full: full-precision residual buffer. Allocated to max_seq_len because
         #          K chunks can be large (multiples of group_size).
         self._k_quant_cache = torch.zeros(
-            batch_size, num_kv_heads, max_seq_len // k_feat_per_int, head_dim,
-            dtype=torch.int32, device=device,
+            batch_size,
+            num_kv_heads,
+            max_seq_len // k_feat_per_int,
+            head_dim,
+            dtype=torch.int32,
+            device=device,
         )
         self._k_scale_cache = torch.zeros(
-            batch_size, num_kv_heads, max_seq_len // group_size, head_dim,
-            dtype=dtype, device=device,
+            batch_size,
+            num_kv_heads,
+            max_seq_len // group_size,
+            head_dim,
+            dtype=dtype,
+            device=device,
         )
         self._k_mn_cache = torch.zeros(
-            batch_size, num_kv_heads, max_seq_len // group_size, head_dim,
-            dtype=dtype, device=device,
-        )
-        self._k_deq_cache = torch.zeros(
-            batch_size, num_kv_heads, max_seq_len, head_dim,
-            dtype=dtype, device=device,
+            batch_size,
+            num_kv_heads,
+            max_seq_len // group_size,
+            head_dim,
+            dtype=dtype,
+            device=device,
         )
         self._k_full = torch.zeros(
-            batch_size, num_kv_heads, max_seq_len, head_dim,
-            dtype=dtype, device=device,
+            batch_size,
+            num_kv_heads,
+            max_seq_len,
+            head_dim,
+            dtype=dtype,
+            device=device,
         )
 
-        self._k_quant_len = 0          # packed seq len written
-        self._k_scale_len = 0          # number of groups written
-        self._k_deq_len = 0            # dequantized seq len written
-        self._k_full_len = 0           # full-precision tokens in _k_full
+        self._k_quant_len = 0  # packed seq len written
+        self._k_scale_len = 0  # number of groups written
+        self._k_full_len = 0  # full-precision tokens in _k_full
 
         # ---- V cache state ----
         # _v_quant_cache: packed int32 codes, shape (B, nh, T, D//v_feat_per_int)
@@ -208,29 +228,40 @@ class KiviKVCacheBackend(KVCacheBackend):
         #          because V quantizes one token at a time and needs a 1-slot
         #          overflow before sliding.
         self._v_quant_cache = torch.zeros(
-            batch_size, num_kv_heads, max_seq_len, head_dim // v_feat_per_int,
-            dtype=torch.int32, device=device,
+            batch_size,
+            num_kv_heads,
+            max_seq_len,
+            head_dim // v_feat_per_int,
+            dtype=torch.int32,
+            device=device,
         )
         self._v_scale_cache = torch.zeros(
-            batch_size, num_kv_heads, max_seq_len, head_dim // group_size,
-            dtype=dtype, device=device,
+            batch_size,
+            num_kv_heads,
+            max_seq_len,
+            head_dim // group_size,
+            dtype=dtype,
+            device=device,
         )
         self._v_mn_cache = torch.zeros(
-            batch_size, num_kv_heads, max_seq_len, head_dim // group_size,
-            dtype=dtype, device=device,
-        )
-        self._v_deq_cache = torch.zeros(
-            batch_size, num_kv_heads, max_seq_len, head_dim,
-            dtype=dtype, device=device,
+            batch_size,
+            num_kv_heads,
+            max_seq_len,
+            head_dim // group_size,
+            dtype=dtype,
+            device=device,
         )
         self._v_full = torch.zeros(
-            batch_size, num_kv_heads, residual_length + 1, head_dim,
-            dtype=dtype, device=device,
+            batch_size,
+            num_kv_heads,
+            residual_length + 1,
+            head_dim,
+            dtype=dtype,
+            device=device,
         )
 
         self._v_quant_len = 0
         self._v_scale_len = 0
-        self._v_deq_len = 0
         self._v_full_len = 0
 
         self._total_len = 0
@@ -242,11 +273,15 @@ class KiviKVCacheBackend(KVCacheBackend):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-    def _quantize_k(self, k_fp16: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _quantize_k(
+        self, k_fp16: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Quantize a K chunk (B, nh, T, D); K is per-channel: group along T, pack along T."""
         return self._pack(k_fp16, self.group_size, self.k_bits)
 
-    def _quantize_v(self, v_fp16: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _quantize_v(
+        self, v_fp16: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Quantize a V chunk (B, nh, T, D); V is per-token: group along D, pack along D."""
         return self._pack_v(v_fp16, self.group_size, self.v_bits)
 
@@ -282,109 +317,131 @@ class KiviKVCacheBackend(KVCacheBackend):
                 self._k_full_len = total
                 self._v_full_len = total
             else:
-                # K: quantize all but the last residual_length tokens
-                n_quant = total - self.residual_length
+                remainder = total % self.residual_length
+                if remainder == 0:
+                    n_quant = total
+                else:
+                    n_quant = total - remainder
+                # align to group_size (required by quantize kernel)
                 n_quant = (n_quant // self.group_size) * self.group_size
-                k_quant_part = k[:, :, :n_quant, :].contiguous()
-                self._k_full[:, :, :total - n_quant, :] = k[:, :, n_quant:, :]
-                self._k_full_len = total - n_quant
 
-                # V: always keep the most recent residual_length tokens in full
-                v_quant_part = v[:, :, :-self.residual_length, :].contiguous()
+                if n_quant == total:
+                    k_quant_part = k.contiguous()
+                    self._k_full_len = 0
+                else:
+                    k_quant_part = k[:, :, :n_quant, :].contiguous()
+                    self._k_full[:, :, :total - n_quant, :] = k[:, :, n_quant:, :]
+                    self._k_full_len = total - n_quant
+
+                v_quant_part = v[:, :, : -self.residual_length, :].contiguous()
                 v_keep = self.residual_length
                 self._v_full[:, :, :v_keep, :] = v[:, :, -v_keep:, :]
                 self._v_full_len = v_keep
 
-                k_code, k_scale, k_mn = self._quantize_k(k_quant_part)
+                if n_quant > 0:
+                    k_code, k_scale, k_mn = self._quantize_k(k_quant_part)
+                    self._k_quant_cache[:, :, : k_code.shape[2], :] = k_code
+                    self._k_scale_cache[:, :, : k_scale.shape[2], :] = k_scale
+                    self._k_mn_cache[:, :, : k_mn.shape[2], :] = k_mn
+                    self._k_quant_len = k_code.shape[2]
+                    self._k_scale_len = k_scale.shape[2]
+                else:
+                    self._k_quant_len = 0
+                    self._k_scale_len = 0
+
                 v_code, v_scale, v_mn = self._quantize_v(v_quant_part)
-
-                self._k_deq_cache[:, :, :k_quant_part.shape[2], :] = (
-                    self._dequant_k(k_code, k_scale, k_mn)
-                )
-                self._k_deq_len = k_quant_part.shape[2]
-                self._k_quant_cache[:, :, :k_code.shape[2], :] = k_code
-                self._k_scale_cache[:, :, :k_scale.shape[2], :] = k_scale
-                self._k_mn_cache[:, :, :k_mn.shape[2], :] = k_mn
-                self._k_quant_len = k_code.shape[2]
-                self._k_scale_len = k_scale.shape[2]
-
-                self._v_deq_cache[:, :, :v_quant_part.shape[2], :] = (
-                    self._dequant_v(v_code, v_scale, v_mn)
-                )
-                self._v_deq_len = v_quant_part.shape[2]
-                self._v_quant_cache[:, :, :v_code.shape[2], :] = v_code
-                self._v_scale_cache[:, :, :v_scale.shape[2], :] = v_scale
-                self._v_mn_cache[:, :, :v_mn.shape[2], :] = v_mn
+                self._v_quant_cache[:, :, : v_code.shape[2], :] = v_code
+                self._v_scale_cache[:, :, : v_scale.shape[2], :] = v_scale
+                self._v_mn_cache[:, :, : v_mn.shape[2], :] = v_mn
                 self._v_quant_len = v_code.shape[2]
                 self._v_scale_len = v_scale.shape[2]
             self._total_len = total
             return
 
         # ---- Decode ----
-        self._k_full[:, :, self._k_full_len:self._k_full_len + seq_len, :] = k
+        self._k_full[:, :, self._k_full_len : self._k_full_len + seq_len, :] = k
         self._k_full_len += seq_len
-        self._v_full[:, :, self._v_full_len:self._v_full_len + seq_len, :] = v
+        self._v_full[:, :, self._v_full_len : self._v_full_len + seq_len, :] = v
         self._v_full_len += seq_len
         self._total_len += seq_len
 
-        # --- K: quantize oldest tokens when full exceeds residual_length ---
-        if self._k_full_len > self.residual_length:
-            n_quant = self._k_full_len - self.residual_length
+        if self._k_full_len == self.residual_length:
+            n_quant = self._k_full_len
             n_quant = (n_quant // self.group_size) * self.group_size
             if n_quant > 0:
                 k_old = self._k_full[:, :, :n_quant, :].contiguous()
                 k_code, k_scale, k_mn = self._quantize_k(k_old)
-                k_chunk_deq = self._dequant_k(k_code, k_scale, k_mn)
-                deq_size = k_chunk_deq.shape[2]
-                self._k_deq_cache[:, :, self._k_deq_len:self._k_deq_len + deq_size, :] = k_chunk_deq
-                self._k_deq_len += deq_size
 
                 qsz = k_code.shape[2]
-                self._k_quant_cache[:, :, self._k_quant_len:self._k_quant_len + qsz, :] = k_code
+                self._k_quant_cache[
+                    :, :, self._k_quant_len : self._k_quant_len + qsz, :
+                ] = k_code
                 self._k_quant_len += qsz
                 ssz = k_scale.shape[2]
-                self._k_scale_cache[:, :, self._k_scale_len:self._k_scale_len + ssz, :] = k_scale
-                self._k_mn_cache[:, :, self._k_scale_len:self._k_scale_len + ssz, :] = k_mn
+                self._k_scale_cache[
+                    :, :, self._k_scale_len : self._k_scale_len + ssz, :
+                ] = k_scale
+                self._k_mn_cache[
+                    :, :, self._k_scale_len : self._k_scale_len + ssz, :
+                ] = k_mn
                 self._k_scale_len += ssz
 
-                self._k_full[:, :, :self._k_full_len - n_quant, :] = self._k_full[:, :, n_quant:self._k_full_len, :]
-                self._k_full_len -= n_quant
+                self._k_full_len = 0
 
-        # --- V: quantize oldest token when full exceeds residual_length ---
         if self._v_full_len > self.residual_length:
             v_old = self._v_full[:, :, :1, :].contiguous()
             v_code, v_scale, v_mn = self._quantize_v(v_old)
-            v_chunk_deq = self._dequant_v(v_code, v_scale, v_mn)
-            self._v_deq_cache[:, :, self._v_deq_len:self._v_deq_len + 1, :] = v_chunk_deq
-            self._v_deq_len += 1
 
-            self._v_quant_cache[:, :, self._v_quant_len:self._v_quant_len + 1, :] = v_code
+            self._v_quant_cache[:, :, self._v_quant_len : self._v_quant_len + 1, :] = (
+                v_code
+            )
             self._v_quant_len += 1
-            self._v_scale_cache[:, :, self._v_scale_len:self._v_scale_len + 1, :] = v_scale
-            self._v_mn_cache[:, :, self._v_scale_len:self._v_scale_len + 1, :] = v_mn
+            self._v_scale_cache[:, :, self._v_scale_len : self._v_scale_len + 1, :] = (
+                v_scale
+            )
+            self._v_mn_cache[:, :, self._v_scale_len : self._v_scale_len + 1, :] = v_mn
             self._v_scale_len += 1
 
-            self._v_full[:, :, :self._v_full_len - 1, :] = self._v_full[:, :, 1:self._v_full_len, :]
+            self._v_full[:, :, : self._v_full_len - 1, :] = self._v_full[
+                :, :, 1 : self._v_full_len, :
+            ].clone()
             self._v_full_len -= 1
 
     def _dequant_k(self, code, scale, mn):
         from kernels.kivi.quant_pack import unpack_and_dequant_kcache
-        return unpack_and_dequant_kcache(code, scale, mn, self.group_size, self.k_bits, out_dtype=self._dtype)
+
+        return unpack_and_dequant_kcache(
+            code, scale, mn, self.group_size, self.k_bits, out_dtype=self._dtype
+        )
 
     def _dequant_v(self, code, scale, mn):
         from kernels.kivi.quant_pack import unpack_and_dequant_vcache
-        return unpack_and_dequant_vcache(code, scale, mn, self.group_size, self.v_bits, out_dtype=self._dtype)
+
+        return unpack_and_dequant_vcache(
+            code, scale, mn, self.group_size, self.v_bits, out_dtype=self._dtype
+        )
 
     def load_kv(self, total_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return dequantized K and V for fallback attention computation."""
-        k = torch.cat([
-            self._k_deq_cache[:, :, :self._k_deq_len, :],
-            self._k_full[:, :, :self._k_full_len, :],
-        ], dim=2)
-        v = torch.cat([
-            self._v_deq_cache[:, :, :self._v_deq_len, :],
-            self._v_full[:, :, :self._v_full_len, :],
-        ], dim=2)
+        """Return dequantized K and V for fallback attention computation.
+
+        Dynamically dequantizes from packed int32 caches on every call.
+        """
+        k_parts = [self._k_full[:, :, : self._k_full_len, :]]
+        if self._k_quant_len > 0:
+            k_code = self._k_quant_cache[:, :, : self._k_quant_len, :]
+            k_scale = self._k_scale_cache[:, :, : self._k_scale_len, :]
+            k_mn = self._k_mn_cache[:, :, : self._k_scale_len, :]
+            k_parts.insert(0, self._dequant_k(k_code, k_scale, k_mn))
+        k = torch.cat(k_parts, dim=2) if len(k_parts) > 1 else k_parts[0]
+
+        v_parts = [self._v_full[:, :, : self._v_full_len, :]]
+        if self._v_quant_len > 0:
+            v_code = self._v_quant_cache[:, :, : self._v_quant_len, :]
+            v_scale = self._v_scale_cache[:, :, : self._v_scale_len, :]
+            v_mn = self._v_mn_cache[:, :, : self._v_scale_len, :]
+            v_parts.insert(0, self._dequant_v(v_code, v_scale, v_mn))
+        v = torch.cat(v_parts, dim=2) if len(v_parts) > 1 else v_parts[0]
+
         assert k.shape[2] == total_len, f"K len mismatch: {k.shape[2]} vs {total_len}"
         assert v.shape[2] == total_len, f"V len mismatch: {v.shape[2]} vs {total_len}"
         return k, v
@@ -399,53 +456,75 @@ class KiviKVCacheBackend(KVCacheBackend):
         # Build empty tensors with correct shape dimensions so that downstream
         # code can query .shape[-1] for head_dim even when length is zero.
         if self._k_quant_len > 0:
-            k_code = self._k_quant_cache[:, :, :self._k_quant_len, :]
-            k_scale = self._k_scale_cache[:, :, :self._k_scale_len, :]
-            k_mn = self._k_mn_cache[:, :, :self._k_scale_len, :]
+            k_code = self._k_quant_cache[:, :, : self._k_quant_len, :]
+            k_scale = self._k_scale_cache[:, :, : self._k_scale_len, :]
+            k_mn = self._k_mn_cache[:, :, : self._k_scale_len, :]
         else:
             k_code = torch.empty(
-                self._batch_size, self._num_kv_heads, 0, self._head_dim,
-                dtype=torch.int32, device=self._device,
+                self._batch_size,
+                self._num_kv_heads,
+                0,
+                self._head_dim,
+                dtype=torch.int32,
+                device=self._device,
             )
             k_scale = torch.empty(
-                self._batch_size, self._num_kv_heads, 0, self._head_dim,
-                dtype=self._dtype, device=self._device,
+                self._batch_size,
+                self._num_kv_heads,
+                0,
+                self._head_dim,
+                dtype=self._dtype,
+                device=self._device,
             )
             k_mn = torch.empty(
-                self._batch_size, self._num_kv_heads, 0, self._head_dim,
-                dtype=self._dtype, device=self._device,
+                self._batch_size,
+                self._num_kv_heads,
+                0,
+                self._head_dim,
+                dtype=self._dtype,
+                device=self._device,
             )
 
         if self._v_quant_len > 0:
-            v_code = self._v_quant_cache[:, :, :self._v_quant_len, :]
-            v_scale = self._v_scale_cache[:, :, :self._v_scale_len, :]
-            v_mn = self._v_mn_cache[:, :, :self._v_scale_len, :]
+            v_code = self._v_quant_cache[:, :, : self._v_quant_len, :]
+            v_scale = self._v_scale_cache[:, :, : self._v_scale_len, :]
+            v_mn = self._v_mn_cache[:, :, : self._v_scale_len, :]
         else:
             v_code = torch.empty(
-                self._batch_size, self._num_kv_heads, 0, self._head_dim // (32 // self.v_bits),
-                dtype=torch.int32, device=self._device,
+                self._batch_size,
+                self._num_kv_heads,
+                0,
+                self._head_dim // (32 // self.v_bits),
+                dtype=torch.int32,
+                device=self._device,
             )
             v_scale = torch.empty(
-                self._batch_size, self._num_kv_heads, 0, self._head_dim // self.group_size,
-                dtype=self._dtype, device=self._device,
+                self._batch_size,
+                self._num_kv_heads,
+                0,
+                self._head_dim // self.group_size,
+                dtype=self._dtype,
+                device=self._device,
             )
             v_mn = torch.empty(
-                self._batch_size, self._num_kv_heads, 0, self._head_dim // self.group_size,
-                dtype=self._dtype, device=self._device,
+                self._batch_size,
+                self._num_kv_heads,
+                0,
+                self._head_dim // self.group_size,
+                dtype=self._dtype,
+                device=self._device,
             )
 
-        k_full = self._k_full[:, :, :self._k_full_len, :]
-        v_full = self._v_full[:, :, :self._v_full_len, :]
+        k_full = self._k_full[:, :, : self._k_full_len, :]
+        v_full = self._v_full[:, :, : self._v_full_len, :]
         return k_code, k_scale, k_mn, k_full, v_code, v_scale, v_mn, v_full
 
     def reset(self) -> None:
         self._k_quant_len = 0
         self._k_scale_len = 0
-        self._k_deq_len = 0
         self._k_full_len = 0
         self._v_quant_len = 0
         self._v_scale_len = 0
-        self._v_deq_len = 0
         self._v_full_len = 0
         self._total_len = 0
 
@@ -453,6 +532,7 @@ class KiviKVCacheBackend(KVCacheBackend):
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
+
 
 def create_kv_backend(
     backend: str,
@@ -508,4 +588,6 @@ def create_kv_backend(
             dtype=dtype,
         )
     else:
-        raise ValueError(f"Unknown KV cache backend: {backend}. Supported: default, kivi.")
+        raise ValueError(
+            f"Unknown KV cache backend: {backend}. Supported: default, kivi."
+        )

@@ -260,35 +260,6 @@ class Attention(nn.Module):
                 self.v_cache[:, :, :total_len, :],
             )
 
-    def _compute_kivi_decode(self, q):
-        """Decode-phase attention using the fused KIVI Triton kernel.
-
-        Replaces the previous 7-kernel path with a 2-kernel fused path:
-        per-tile partial attention + cross-tile reduction.
-
-        Args:
-            q (torch.Tensor): Query tensor, shape (B, num_heads, 1, head_dim).
-
-        Returns:
-            torch.Tensor: Attention output, shape (B, num_heads, 1, head_dim).
-        """
-        from kernels.kivi.fused_attention import kivi_fused_decode_attention
-
-        backend = self.kv_backend
-        k_code, k_scale, k_mn, k_full, v_code, v_scale, v_mn, v_full = (
-            backend.get_quantized_state()
-        )
-
-        return kivi_fused_decode_attention(
-            q,
-            k_code, k_scale, k_mn, k_full,
-            v_code, v_scale, v_mn, v_full,
-            scale=self.scale,
-            group_size=backend.group_size,
-            k_bits=backend.k_bits,
-            v_bits=backend.v_bits,
-        )
-
     def _compute(self, q, k, v, is_prefill, cache_len):
         """Compute scaled dot-product attention over q, k, v.
 
@@ -435,16 +406,9 @@ class Attention(nn.Module):
             return o
 
         self._store_kv(k, v, cache_len, seq_len, is_prefill)
-        if (
-            not is_prefill
-            and self.kv_backend is not None
-            and hasattr(self.kv_backend, "get_quantized_state")
-        ):
-            o = self._compute_kivi_decode(q)
-        else:
-            total_len = cache_len + seq_len
-            k_for_attn, v_for_attn = self._load_kv(total_len, is_prefill, k, v)
-            o = self._compute(q, k_for_attn, v_for_attn, is_prefill, cache_len)
+        total_len = cache_len + seq_len
+        k_for_attn, v_for_attn = self._load_kv(total_len, is_prefill, k, v)
+        o = self._compute(q, k_for_attn, v_for_attn, is_prefill, cache_len)
 
         o = o.transpose(1, 2)
         return o
