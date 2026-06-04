@@ -8,7 +8,7 @@ env:
     world_size: 1
 
 inference:
-  backend: default             # [default, megakernel_cuda]
+  backend: megakernel_cuda             # [default, megakernel_cuda]
   megakernel_variant: all_combined             # [default, naive, p0, p1, p3, p4, p6, p7, p8, p9, p9_combined, p10, all_combined]
   check_correction: false
   max_new_tokens: 512
@@ -33,22 +33,11 @@ inference:
     # - model.embed_tokens
     # - lm_head
 
-  # KV-cache backend configuration.
-  #   backend: "default"  -> dense FP16/BF16 cache (no quantization)
-  #   backend: "kivi"    -> asymmetric grouped quant (see below)
   kv_cache:
-    backend: kivi
-    # Quantization bits for K and V caches (2 or 4).
-    # NOTE: Qwen3-0.6B has very large K activation range after RoPE (~[-446,448]).
-    #       2-bit K quant on this model yields high error. Recommend k_bits=4
-    #       or residual_length>=64 for usable quality.
-    k_bits: 4
-    v_bits: 4
-    # Group size for asymmetric min-max quant. Must divide head_dim for V and
-    # seq_len chunk for K.
+    backend: default # default, kivi
+    k_bits: 2
+    v_bits: 2
     group_size: 64
-    # Number of most-recent tokens kept in full precision. Larger = better
-    # accuracy, less compression. For Qwen3-0.6B with 2-bit K, 64+ recommended.
     residual_length: 64
 
 path:
