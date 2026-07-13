@@ -181,8 +181,9 @@ class KiviKVCacheBackend(KVCacheBackend):
         # _k_quant_cache: packed int32 codes, shape (B, nh, T//k_feat_per_int, D)
         # _k_scale_cache: per-group scale, shape (B, nh, T//group_size, D)
         # _k_mn_cache: per-group min, shape (B, nh, T//group_size, D)
-        # _k_full: full-precision residual buffer. Allocated to max_seq_len because
-        #          K chunks can be large (multiples of group_size).
+        # _k_full: full-precision residual buffer. Allocated to residual_length + group_size
+        #          because prefill may leave up to residual_length + group_size - 2 tokens
+        #          before the first decode quantize triggers.
         self._k_quant_cache = torch.zeros(
             batch_size,
             num_kv_heads,
@@ -210,7 +211,7 @@ class KiviKVCacheBackend(KVCacheBackend):
         self._k_full = torch.zeros(
             batch_size,
             num_kv_heads,
-            max_seq_len,
+            residual_length + group_size,
             head_dim,
             dtype=dtype,
             device=device,

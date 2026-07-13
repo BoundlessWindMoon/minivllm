@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from model.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5Model
-from utils.model_config import Qwen3_5Config
+from model.model_config import Qwen3_5Config
 from layers.embed_head import ParallelLMHead
 
 

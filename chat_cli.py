@@ -90,7 +90,7 @@ def main() -> None:
 
     # Guard sequence length by the KV cache limit (if configured),
     # otherwise fall back to the model's theoretical maximum.
-    max_seq_len = cfg.inference.kv_cache_max_len or getattr(
+    max_seq_len = cfg.model.kv_cache.max_len or getattr(
         model.config, "max_position_embeddings", 4096
     )
 
@@ -103,7 +103,7 @@ def main() -> None:
         max_seq_len=max_seq_len,
         device=cfg.env.device,
         system_prompt=args.system,
-        use_thinking=cfg.inference.use_thinking,
+        use_thinking=cfg.generation.use_thinking,
     )
 
     ui.print_header(model_name=model_name)
@@ -151,7 +151,7 @@ def main() -> None:
             output_ids = runner.generate(
                 input_ids,
                 cached_len=cached_len,
-                max_new_tokens=cfg.inference.max_new_tokens,
+                max_new_tokens=cfg.generation.max_new_tokens,
             )
         except Exception as exc:
             ui.print_error(f"生成失败: {exc}")

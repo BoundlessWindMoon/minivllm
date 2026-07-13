@@ -1,0 +1,17 @@
+_base: ../models/qwen3.yaml
+
+# Standard single-request inference run on Qwen3.
+# Switch model: python main.py --config configs/runs/default.yaml --model qwen3_5
+
+model:
+  backend: megakernel_cuda
+  megakernel_variant: all_combined
+
+generation:
+  prompt: "我要去八达岭长城玩，你觉得怎么样？"
+  max_new_tokens: 512
+  sampling:
+    sample_method: topp
+    temperature: 1.5
+    topk: 10
+    topp: 1.0

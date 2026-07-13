@@ -305,7 +305,7 @@ class ProfileSession:
 def build_profiler(cfg) -> ProfileSession:
     """Build a ProfileSession from GlobalConfig.
 
-    Supports both new-style ``cfg.profiling.*`` and legacy ``cfg.inference.use_profile``.
+    Supports both new-style ``cfg.profiling.*`` and legacy ``cfg.profiling.torch_profiler.enabled``.
     """
     session = ProfileSession()
 
@@ -349,7 +349,7 @@ def build_profiler(cfg) -> ProfileSession:
                 logger.warning(f"[Profiler] Failed to register JSONFileBackend: {e}")
 
         # Legacy fallback: if no new-style backend is enabled
-        if not session._backends and getattr(cfg.inference, "use_profile", False):
+        if not session._backends and cfg.profiling.torch_profiler.enabled:
             try:
                 profile_dir = getattr(cfg.path, "profile_dir", "./log/profile/")
                 session.add(TorchProfilerBackend(profile_dir=profile_dir))
@@ -360,7 +360,7 @@ def build_profiler(cfg) -> ProfileSession:
         return session
 
     # Legacy fallback when profiling config does not exist at all
-    if getattr(cfg.inference, "use_profile", False):
+    if cfg.profiling.torch_profiler.enabled:
         try:
             profile_dir = getattr(cfg.path, "profile_dir", "./log/profile/")
             session.add(TorchProfilerBackend(profile_dir=profile_dir))

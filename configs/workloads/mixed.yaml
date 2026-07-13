@@ -1,0 +1,19 @@
+_base: ../runs/batch.yaml
+# Mixed workload: 60 chat (ShareGPT) + 60 coding (HumanEval/MBPP) + 60 long_context (MS-MARCO)
+# prompt range: ~10~600 tok, decode: natural EOS capped at 512, seed=42
+# slots=24 / max_len=1500 fits within 6GB VRAM (KV pool ~3938MB, margin ~892MB).
+model:
+  kv_cache:
+    max_len: 1500
+generation:
+  max_new_tokens: 512
+batch:
+  num_slots: 24
+  max_batch_size: 12
+  max_num_batched_tokens: null
+  timeout_seconds: null
+  prompts:
+    asset: assets/prompts/mixed.jsonl
+    random: true
+    seed: 42
+    num_requests: 60

@@ -30,7 +30,7 @@ except Exception:
 from layers.attention import Attention
 from layers.rotary_embedding import apply_rotary_pos_emb, RotaryEmbedding
 from engine.context import get_context
-from utils.model_config import Qwen3_5Config
+from model.model_config import Qwen3_5Config
 
 USE_TRITON = True
 

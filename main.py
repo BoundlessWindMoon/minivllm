@@ -4,7 +4,7 @@ import torch
 import torch.distributed as dist
 
 from utils.logger import logger
-from utils.config import GlobalConfig, print_runtime_config
+from utils.config import GlobalConfig, print_runtime_config, dump_config
 from engine.model_runner import ModelRunner
 from engine.loader import load_model
 from engine.runtime_setup import apply_runtime_patches
@@ -13,9 +13,17 @@ from engine.processor import load_processor
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--config", default="configs/runs/default.yaml")
+    parser.add_argument("--model", default=None,
+                        help="Override the model layer, e.g. 'qwen3_5' or a yaml path")
+    parser.add_argument("--dump-config", action="store_true",
+                        help="Print the fully-merged config and exit")
     args = parser.parse_args()
-    cfg = GlobalConfig.from_yaml(args.config)
+    cfg = GlobalConfig.from_yaml(args.config, model=args.model)
+
+    if args.dump_config:
+        print(dump_config(cfg))
+        return
 
     torch.set_default_dtype(cfg.env.get_torch_dtype())
     torch.set_default_device(cfg.env.device)

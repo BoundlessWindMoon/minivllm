@@ -91,8 +91,8 @@ def main():
 
     # ---- Baseline run ----
     print("[Baseline] Loading model with default KV cache...")
-    cfg.inference.use_cuda_graph = False
-    cfg.inference.backend = "default"
+    cfg.model.use_cuda_graph = False
+    cfg.model.backend = "default"
     model, tokenizer = load_model(cfg)
 
     reset_kv_cache(model)
@@ -103,11 +103,11 @@ def main():
 
     # ---- KIVI run ----
     print("\n[KIVI] Loading model with KiviKVCacheBackend...")
-    cfg.inference.kv_cache.backend = "kivi"
-    cfg.inference.kv_cache.k_bits = args.k_bits
-    cfg.inference.kv_cache.v_bits = args.v_bits
-    cfg.inference.kv_cache.group_size = args.group_size
-    cfg.inference.kv_cache.residual_length = args.residual_length
+    cfg.model.kv_cache.backend = "kivi"
+    cfg.model.kv_cache.k_bits = args.k_bits
+    cfg.model.kv_cache.v_bits = args.v_bits
+    cfg.model.kv_cache.group_size = args.group_size
+    cfg.model.kv_cache.residual_length = args.residual_length
 
     model_kivi, tokenizer_kivi = load_model(cfg)
     model_kivi = apply_runtime_patches(model_kivi, cfg)

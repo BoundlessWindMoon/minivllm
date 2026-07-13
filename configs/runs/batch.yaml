@@ -1,0 +1,34 @@
+_base: ../models/qwen3.yaml
+
+# Batch inference run (BatchedModelRunner).
+# Uses torch backend; megakernel does not support bs > 1.
+
+model:
+  backend: default
+  use_cuda_graph: false
+  kv_cache:
+    backend: default
+
+generation:
+  max_new_tokens: 512        # fallback; per-prompt values in the asset take priority
+  stop_on_eos: true
+  use_thinking: false
+  sampling:
+    sample_method: greedy
+    temperature: 0.0
+
+batch:
+  num_slots: 8
+  max_batch_size: 4
+  # Admission policy: "fifo" | "spf" (shortest-prompt-first) | "ljf" (longest-job-first) | "random"
+  admission_policy: fifo
+  # Chunked prefill: total token budget (prefill + decode) per step.
+  # null = disabled (full prompt processed in one step).
+  # Set to e.g. 512 to enable vLLM-style chunked prefill.
+  max_num_batched_tokens: null
+  timeout_seconds: 60
+  prompts:
+    asset: assets/prompts/default.jsonl
+    random: true
+    seed: 42
+    num_requests: 16

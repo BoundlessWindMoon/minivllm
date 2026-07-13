@@ -44,7 +44,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 OUT_DIR="$PROJECT_DIR/log/ablation/$VARIANT"
 NCU_DIR="$OUT_DIR/ncu"
 mkdir -p "$NCU_DIR"
@@ -106,10 +106,5 @@ unset MINI_VLLM_NCU_DECODE
 ncu --import "$NCU_DIR/profile.ncu-rep" --csv --page raw \
     --log-file "$NCU_DIR/profile.csv" --force-overwrite \
     > "$NCU_DIR/ncu_export.txt" 2>&1
-
-python "$SCRIPT_DIR/parse_ncu_csv.py" "$NCU_DIR/profile.csv" \
-    > "$NCU_DIR/profile_report.txt"
-python "$SCRIPT_DIR/parse_ncu_csv.py" "$NCU_DIR/profile.csv" \
-    --json "$NCU_DIR/profile.json" >/dev/null
 
 echo "==> [$VARIANT] done. Outputs in $OUT_DIR/"

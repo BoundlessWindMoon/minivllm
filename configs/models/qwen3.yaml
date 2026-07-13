@@ -1,0 +1,22 @@
+_base: ../base.yaml
+
+# Qwen3 family (0.6B / 1.7B / 4B / 8B / 14B / 32B).
+# Covers model paths and model-specific defaults.
+# Do NOT put run-specific settings (backend, sampling, profiling) here.
+
+path:
+  model_path: ~/huggingface/Qwen3-0.6B/
+  quantized_model_path: ~/huggingface/Qwen3-0.6B-AWQ_Cached
+  baseline_model_path: ~/huggingface/baseline/
+
+model:
+  kv_cache:
+    backend: kivi
+    k_bits: 2
+    v_bits: 2
+    group_size: 16
+    residual_length: 16
+
+generation:
+  use_chat_template: true
+  use_thinking: true

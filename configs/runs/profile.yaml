@@ -1,0 +1,34 @@
+_base: ./default.yaml
+
+# Profiling run: torch profiler on, EOS disabled so every run hits max_new_tokens.
+
+model:
+  backend: megakernel_cuda
+
+generation:
+  prompt: "Hello, I am sakuya, I'm a 24 year old student from UCAS University. I like LLM and Infra"
+  max_new_tokens: 256
+  stop_on_eos: false
+  use_chat_template: false
+  use_thinking: false
+  sampling:
+    sample_method: greedy
+    temperature: 1.0
+    topk: 1
+    topp: 1.0
+
+path:
+  model_path: /home/sakuya/huggingface/Qwen3-0.6B/
+  quantized_model_path: /home/sakuya/huggingface/Qwen3-0.6B-AWQ_Cached
+
+quant:
+  backend: triton_wt_fused
+  calibration:
+    max_seq_length: 512
+  quant_targets: [MLP, ATTENTION, LM_HEAD]
+
+profiling:
+  torch_profiler:
+    enabled: true
+  json:
+    path: ./log/profile/profile.json

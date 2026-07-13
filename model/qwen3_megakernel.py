@@ -8,7 +8,7 @@ with the same kernel, re-using the KV cache populated during prefill.
 import torch
 from torch import nn
 
-from model.megakernel_weights import extract_megakernel_weights
+from model.megakernel_weights_qwen3 import extract_megakernel_weights
 from kernels.megakernel_cuda import _get_module
 
 
