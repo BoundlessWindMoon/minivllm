@@ -55,7 +55,7 @@ cd mini-vllm
 uv venv .venv --python 3.12
 source .venv/bin/activate
 
-# PyTorch — match your CUDA version (cu128 shown here)
+# PyTorch (match your CUDA version)
 uv pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128
 
 # Core dependencies
@@ -127,6 +127,7 @@ mini-vllm/
 ├── quantization/       # AWQ calibration and quantized layers
 ├── eval/               # lm-eval adapter
 ├── scripts/            # Benchmark, verify, profile tools
+├── test/               # Functional test suite (pytest)
 ├── assets/prompts/     # JSONL prompt workloads for batch testing
 ├── main.py             # Entry point: single-request inference
 ├── batch_main.py       # Entry point: continuous batching
