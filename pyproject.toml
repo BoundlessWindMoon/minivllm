@@ -8,6 +8,7 @@ license = { text = "MIT" }
 
 dependencies = [
     "torch==2.9.0",
+    "pytest>=8.0",
     "transformers>=5.9.0",
     "accelerate",
     "safetensors",
@@ -41,7 +42,7 @@ monitor = [
     "swanlab",
 ]
 all = [
-    "mini-vllm[flash_attn,benchmark,quant,profile,monitor]",
+    "mini-vllm[benchmark,quant,profile,monitor]",
 ]
 
 
