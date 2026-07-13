@@ -1,9 +1,9 @@
-"""Attention layer implementations (Flash/SimpleAttention + KV cache)."""
+"""Attention layer with KV cache, Flash Attention, and SDPA backends."""
+
+import os
 
 import torch
 from torch import nn
-import triton
-import triton.language as tl
 import torch.nn.functional as F
 
 from utils.logger import logger
@@ -11,51 +11,15 @@ from engine.context import get_context
 
 try:
     from flash_attn import flash_attn_with_kvcache
-
+    from flash_attn import flash_attn_varlen_func as _fa_varlen
+    from flash_attn.bert_padding import unpad_input as _unpad_input, pad_input as _pad_input
     _FA_AVAILABLE = True
 except Exception:
     _FA_AVAILABLE = False
 
-
-@triton.jit
-def store_kvcache_kernel(
-    key_ptr,
-    key_stride,
-    value_ptr,
-    value_stride,
-    k_cache_ptr,
-    v_cache_ptr,
-    slot_mapping_ptr,
-    D: tl.constexpr,
-):
-    idx = tl.program_id(0)
-    slot = tl.load(slot_mapping_ptr + idx)
-    if slot == -1:
-        return
-    key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
-    key = tl.load(key_ptr + key_offsets)
-    value = tl.load(value_ptr + value_offsets)
-    cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
-
-
-def store_kvcache(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-):
-    if len(key.shape) == 3:
-        N, num_heads, head_dim = key.shape
-        D = num_heads * head_dim
-    assert k_cache.stride(1) == D and v_cache.stride(1) == D
-    assert slot_mapping.numel() == N
-    store_kvcache_kernel[(N,)](
-        key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D
-    )
+# Disable via env: MINI_VLLM_FA_DECODE=0 or MINI_VLLM_FA_PREFILL=0
+_USE_FA_DECODE  = _FA_AVAILABLE and os.environ.get("MINI_VLLM_FA_DECODE",  "1") != "0"
+_USE_FA_PREFILL = _FA_AVAILABLE and os.environ.get("MINI_VLLM_FA_PREFILL", "1") != "0"
 
 
 class Attention(nn.Module):
@@ -98,56 +62,16 @@ class Attention(nn.Module):
                 "KVCacheBackend does not support CUDA Graph bucketing. "
                 "Set use_cuda_graph_bucket=False when using a custom kv_backend."
             )
-        if self.kv_backend is not None and self.attention_backend == "flash_attn":
-            raise ValueError(
-                "KVCacheBackend does not support Flash Attention. "
-                "Set attention_backend='sdpa' or 'naive' when using a custom kv_backend."
-            )
 
         if self.kv_backend is None:
             if self.preallocate_cache:
-                if self.attention_backend == "flash_attn":
-                    self.register_buffer(
-                        "k_cache",
-                        torch.zeros(
-                            self.batch_size,
-                            self.max_seq_len,
-                            self.num_kv_heads,
-                            self.head_dim,
-                        ),
-                        persistent=False,
-                    )
-                    self.register_buffer(
-                        "v_cache",
-                        torch.zeros(
-                            self.batch_size,
-                            self.max_seq_len,
-                            self.num_kv_heads,
-                            self.head_dim,
-                        ),
-                        persistent=False,
-                    )
-                else:
-                    self.register_buffer(
-                        "k_cache",
-                        torch.zeros(
-                            self.batch_size,
-                            self.num_kv_heads,
-                            self.max_seq_len,
-                            self.head_dim,
-                        ),
-                        persistent=False,
-                    )
-                    self.register_buffer(
-                        "v_cache",
-                        torch.zeros(
-                            self.batch_size,
-                            self.num_kv_heads,
-                            self.max_seq_len,
-                            self.head_dim,
-                        ),
-                        persistent=False,
-                    )
+                shape = (
+                    (self.batch_size, self.max_seq_len, self.num_kv_heads, self.head_dim)
+                    if attention_backend == "flash_attn"
+                    else (self.batch_size, self.num_kv_heads, self.max_seq_len, self.head_dim)
+                )
+                self.register_buffer("k_cache", torch.zeros(shape), persistent=False)
+                self.register_buffer("v_cache", torch.zeros(shape), persistent=False)
             else:
                 self.k_cache = None
                 self.v_cache = None
@@ -155,38 +79,16 @@ class Attention(nn.Module):
             self.register_buffer("k_cache", None, persistent=False)
             self.register_buffer("v_cache", None, persistent=False)
 
+        self.register_buffer("_write_pos", torch.zeros(1, dtype=torch.long), persistent=False)
         self.register_buffer(
-            "_write_pos",
-            torch.zeros(1, dtype=torch.long),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_attn_mask",
-            torch.full((1, 1, 1, self.max_seq_len), float("-inf")),
-            persistent=False,
+            "_attn_mask", torch.full((1, 1, 1, self.max_seq_len), float("-inf")), persistent=False
         )
 
     def _store_kv(self, k, v, cache_len, seq_len, is_prefill):
-        """Store new key/value tensors into the KV cache.
-
-        Handles all write paths: custom kv_backend, CUDA-graph scatter,
-        dense pre-allocated cache, and dense dynamic cache.
-
-        Args:
-            k (torch.Tensor): Key tensor, shape (B, num_kv_heads, seq_len, head_dim).
-            v (torch.Tensor): Value tensor, shape (B, num_kv_heads, seq_len, head_dim).
-            cache_len (int): Number of tokens already cached before this write.
-            seq_len (int): Number of new tokens in *k* and *v*.
-            is_prefill (bool): True during prefill; False during decode.
-
-        Returns:
-            None
-        """
         if is_prefill:
             if self.kv_backend is not None:
                 self.kv_backend.store_kv(k, v, cache_len, is_prefill=True)
                 return
-
             if not self.preallocate_cache:
                 if self.k_cache is None:
                     self.k_cache = k.clone()
@@ -197,8 +99,8 @@ class Attention(nn.Module):
                     pad = needed - self.k_cache.shape[2]
                     self.k_cache = F.pad(self.k_cache, (0, 0, 0, pad))
                     self.v_cache = F.pad(self.v_cache, (0, 0, 0, pad))
-            self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
-            self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
+            self.k_cache[:, :, cache_len:cache_len + seq_len] = k
+            self.v_cache[:, :, cache_len:cache_len + seq_len] = v
         else:
             if self.kv_backend is not None:
                 self.kv_backend.store_kv(k, v, cache_len, is_prefill=False)
@@ -219,98 +121,54 @@ class Attention(nn.Module):
                             pad = needed - self.k_cache.shape[2]
                             self.k_cache = F.pad(self.k_cache, (0, 0, 0, pad))
                             self.v_cache = F.pad(self.v_cache, (0, 0, 0, pad))
-                        self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
-                        self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
+                        self.k_cache[:, :, cache_len:cache_len + seq_len] = k
+                        self.v_cache[:, :, cache_len:cache_len + seq_len] = v
                 else:
-                    self.k_cache[:, :, cache_len : cache_len + seq_len, :] = k
-                    self.v_cache[:, :, cache_len : cache_len + seq_len, :] = v
+                    self.k_cache[:, :, cache_len:cache_len + seq_len] = k
+                    self.v_cache[:, :, cache_len:cache_len + seq_len] = v
 
     def _load_kv(self, total_len, is_prefill, k_input, v_input):
-        """Retrieve key/value tensors from the cache for attention computation.
-
-        Handles all read paths: custom kv_backend, CUDA-graph full cache,
-        dense pre-allocated cache (sliced), and dense dynamic cache.
-
-        Args:
-            total_len (int): Total sequence length to retrieve (cache_len + seq_len).
-            is_prefill (bool): True during prefill; False during decode.
-            k_input (torch.Tensor): Input key tensor, shape (B, num_kv_heads, seq_len, head_dim).
-            v_input (torch.Tensor): Input value tensor, shape (B, num_kv_heads, seq_len, head_dim).
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - k: shape (B, num_kv_heads, total_len, head_dim)
-                - v: shape (B, num_kv_heads, total_len, head_dim)
-        """
         if self.kv_backend is not None:
-            return self.kv_backend.load_kv(total_len)
-
+            return self.kv_backend.load_kv_for_sdpa(total_len)
         if is_prefill:
             if total_len > k_input.shape[2]:
-                return (
-                    self.k_cache[:, :, :total_len, :],
-                    self.v_cache[:, :, :total_len, :],
-                )
+                return self.k_cache[:, :, :total_len], self.v_cache[:, :, :total_len]
             return k_input, v_input
         else:
             if self.use_cuda_graph_bucket or not self.preallocate_cache:
                 return self.k_cache, self.v_cache
-            return (
-                self.k_cache[:, :, :total_len, :],
-                self.v_cache[:, :, :total_len, :],
-            )
+            return self.k_cache[:, :, :total_len], self.v_cache[:, :, :total_len]
 
-    def _compute(self, q, k, v, is_prefill, cache_len):
-        """Compute scaled dot-product attention over q, k, v.
-
-        Supports both SDPA and naive manual matmul paths.
-        Handles GQA head replication, causal masking for prefill, and bucket
-        masking for CUDA-graph decode.
-
-        Args:
-            q (torch.Tensor): Query tensor, shape (B, num_heads, seq_len_q, head_dim).
-            k (torch.Tensor): Key tensor, shape (B, num_kv_heads, seq_len_k, head_dim).
-            v (torch.Tensor): Value tensor, shape (B, num_kv_heads, seq_len_k, head_dim).
-            is_prefill (bool): True during prefill; False during decode.
-            cache_len (int): Number of previously cached tokens.
-
-        Returns:
-            torch.Tensor: Attention output, shape (B, num_heads, seq_len_q, head_dim).
-        """
+    def _compute(self, q, k, v, is_prefill, cache_len, attn_mask=None):
         n_rep = self.num_heads // self.num_kv_heads
         if n_rep > 1:
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
 
         if self.attention_backend == "sdpa":
-            if is_prefill:
+            if attn_mask is not None:
+                o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask.to(q.dtype))
+            elif is_prefill:
                 if cache_len > 0:
-                    seq_len_q = q.shape[2]
-                    seq_len_k = k.shape[2]
-                    # Vectorized causal mask: position (i, j) is visible when j <= cache_len + i
-                    q_pos = torch.arange(seq_len_q, device=q.device).unsqueeze(1)
-                    k_pos = torch.arange(seq_len_k, device=q.device).unsqueeze(0)
+                    q_pos = torch.arange(q.shape[2], device=q.device).unsqueeze(1)
+                    k_pos = torch.arange(k.shape[2], device=q.device).unsqueeze(0)
                     mask = torch.where(k_pos <= cache_len + q_pos, 0.0, float("-inf"))
-                    mask = mask.unsqueeze(0).unsqueeze(0)
-                    o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+                    o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask.unsqueeze(0).unsqueeze(0))
                 else:
                     o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             else:
                 if self.use_cuda_graph_bucket:
-                    o = F.scaled_dot_product_attention(
-                        q, k, v, attn_mask=self._attn_mask, is_causal=False
-                    )
+                    o = F.scaled_dot_product_attention(q, k, v, attn_mask=self._attn_mask)
                 else:
                     o = F.scaled_dot_product_attention(q, k, v, is_causal=False)
         else:
-            # naive
             attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-            seq_len_q = q.shape[2]
-            if is_prefill:
-                seq_len_k = k.shape[2]
+            if attn_mask is not None:
+                attn_weights = attn_weights + attn_mask.to(attn_weights.dtype)
+            elif is_prefill:
                 causal_mask = torch.triu(
-                    torch.ones(seq_len_q, seq_len_k, device=q.device, dtype=torch.bool),
-                    diagonal=seq_len_k - seq_len_q + 1,
+                    torch.ones(q.shape[2], k.shape[2], device=q.device, dtype=torch.bool),
+                    diagonal=k.shape[2] - q.shape[2] + 1,
                 )
                 attn_weights = attn_weights.masked_fill(causal_mask, float("-inf"))
             elif self.use_cuda_graph_bucket:
@@ -320,42 +178,27 @@ class Attention(nn.Module):
 
         return o
 
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        use_cache: bool = True,
-    ):
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, use_cache: bool = True):
         if not use_cache:
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             n_rep = self.num_heads // self.num_kv_heads
             if n_rep > 1:
                 k = k.repeat_interleave(n_rep, dim=1)
                 v = v.repeat_interleave(n_rep, dim=1)
-
-            o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-
-            o = o.transpose(1, 2)
-            return o
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2)
 
         ctx = get_context()
-        if ctx:
-            is_prefill = ctx.is_prefill
-            cache_len = ctx.cache_len
-        else:
-            logger.error("ctx is not available.")
+        if not ctx:
             raise RuntimeError("ctx is not available.")
 
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        is_prefill = ctx.is_prefill
+        cache_len  = ctx.cache_len
+        attn_mask  = ctx.attn_mask
 
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         seq_len = q.shape[2]
 
+        # Single-request flash_attn path (kv_backend=None, attention_backend="flash_attn")
         if self.attention_backend == "flash_attn":
             q_bshd = q.transpose(1, 2)
             k_bshd = k.transpose(1, 2)
@@ -364,51 +207,64 @@ class Attention(nn.Module):
                 needed = cache_len + seq_len
                 if self.k_cache is None:
                     self.k_cache = torch.zeros(
-                        self.batch_size,
-                        needed,
-                        self.num_kv_heads,
-                        self.head_dim,
-                        dtype=k_bshd.dtype,
-                        device=k_bshd.device,
+                        self.batch_size, needed, self.num_kv_heads, self.head_dim,
+                        dtype=k_bshd.dtype, device=k_bshd.device,
                     )
-                    self.v_cache = torch.zeros(
-                        self.batch_size,
-                        needed,
-                        self.num_kv_heads,
-                        self.head_dim,
-                        dtype=v_bshd.dtype,
-                        device=v_bshd.device,
-                    )
+                    self.v_cache = torch.zeros_like(self.k_cache)
                 elif needed > self.k_cache.shape[1]:
                     pad = needed - self.k_cache.shape[1]
                     self.k_cache = F.pad(self.k_cache, (0, 0, 0, 0, 0, pad, 0, 0))
                     self.v_cache = F.pad(self.v_cache, (0, 0, 0, 0, 0, pad, 0, 0))
-            if is_prefill:
-                o = flash_attn_with_kvcache(
-                    q_bshd,
-                    self.k_cache,
-                    self.v_cache,
-                    k=k_bshd,
-                    v=v_bshd,
-                    cache_seqlens=cache_len,
-                    causal=True,
-                )
-            else:
-                o = flash_attn_with_kvcache(
-                    q_bshd,
-                    self.k_cache,
-                    self.v_cache,
-                    k=k_bshd,
-                    v=v_bshd,
-                    cache_seqlens=cache_len,
-                    causal=False,
-                )
-            return o
+            return flash_attn_with_kvcache(
+                q_bshd, self.k_cache, self.v_cache,
+                k=k_bshd, v=v_bshd,
+                cache_seqlens=cache_len,
+                causal=is_prefill,
+            )
 
         self._store_kv(k, v, cache_len, seq_len, is_prefill)
         total_len = cache_len + seq_len
-        k_for_attn, v_for_attn = self._load_kv(total_len, is_prefill, k, v)
-        o = self._compute(q, k_for_attn, v_for_attn, is_prefill, cache_len)
 
-        o = o.transpose(1, 2)
-        return o
+        # Batch prefill: varlen flash attention to avoid padding cost.
+        if self.kv_backend is not None and is_prefill and _USE_FA_PREFILL and ctx.cu_seqlens_q is not None:
+            batch, heads, max_chunk, dim = q.shape
+            kv_heads = k.shape[1]
+
+            cu_q = ctx.cu_seqlens_q
+            seq_idx = torch.arange(max_chunk, device=q.device).unsqueeze(0)
+            lengths = (cu_q[1:] - cu_q[:-1]).unsqueeze(1)
+            mask = seq_idx < lengths  # (B, max_chunk)
+
+            q_unpad, idx_q, cu_q2, max_sq, _ = _unpad_input(
+                q.permute(0, 2, 1, 3).reshape(batch, max_chunk, heads * dim), mask
+            )
+            k_unpad, _,     cu_k2, max_sk, _ = _unpad_input(
+                k.permute(0, 2, 1, 3).reshape(batch, max_chunk, kv_heads * dim), mask
+            )
+            v_unpad, _,     _,     _,     _ = _unpad_input(
+                v.permute(0, 2, 1, 3).reshape(batch, max_chunk, kv_heads * dim), mask
+            )
+
+            o_unpad = _fa_varlen(
+                q_unpad.view(-1, heads, dim),
+                k_unpad.view(-1, kv_heads, dim),
+                v_unpad.view(-1, kv_heads, dim),
+                cu_q2, cu_k2, int(max_sq), int(max_sk),
+                softmax_scale=self.scale,
+                causal=True,
+            )
+            o_pad = _pad_input(o_unpad.view(-1, heads * dim), idx_q, batch, max_chunk)
+            return o_pad.view(batch, max_chunk, heads, dim)
+
+        # Batch decode: flash_attn_with_kvcache attends each sequence to its own depth.
+        if self.kv_backend is not None and not is_prefill and _USE_FA_DECODE:
+            k_cache, v_cache = self.kv_backend.load_kv_for_fa_decode()
+            return flash_attn_with_kvcache(
+                q.permute(0, 2, 1, 3), k_cache, v_cache,
+                cache_seqlens=(ctx.cache_lens + 1).to(torch.int32),
+                softmax_scale=self.scale,
+                causal=False,
+            )
+
+        k_for_attn, v_for_attn = self._load_kv(total_len, is_prefill, k, v)
+        return self._compute(q, k_for_attn, v_for_attn, is_prefill, cache_len, attn_mask).transpose(1, 2)

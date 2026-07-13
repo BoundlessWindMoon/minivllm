@@ -33,8 +33,8 @@ class MiniVLLM(TemplateLM):
 
         # Force default backend: megakernel does not return standard logits
         # and greedy_fast_path breaks loglikelihood scoring.
-        self.cfg.inference.backend = "default"
-        self.cfg.inference.use_cuda_graph = False
+        self.cfg.model.backend = "default"
+        self.cfg.model.use_cuda_graph = False
 
         torch.set_default_dtype(self.cfg.env.get_torch_dtype())
         torch.set_default_device(self.cfg.env.device)
@@ -79,7 +79,7 @@ class MiniVLLM(TemplateLM):
 
     @property
     def max_gen_toks(self) -> int:
-        return self.cfg.inference.max_new_tokens
+        return self.cfg.generation.max_new_tokens
 
     @property
     def batch_size(self) -> int:

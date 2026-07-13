@@ -1,0 +1,12 @@
+_base: ../runs/batch.yaml
+# Coding workload: medium input, long output (~1:4 ratio).
+# timeout=null ensures all requests complete regardless of decode length.
+generation:
+  max_new_tokens: 512
+batch:
+  timeout_seconds: null
+  prompts:
+    asset: assets/prompts/coding.jsonl
+    random: true
+    seed: 42
+    num_requests: 16

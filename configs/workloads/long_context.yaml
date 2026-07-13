@@ -1,0 +1,12 @@
+_base: ../runs/batch.yaml
+# Long-context / RAG workload: high I/O ratio (~10:1), prefill dominates.
+# num_requests=8 + timeout=null keeps wall time under ~5 min on a single GPU.
+generation:
+  max_new_tokens: 150
+batch:
+  timeout_seconds: null
+  prompts:
+    asset: assets/prompts/long_context.jsonl
+    random: true
+    seed: 42
+    num_requests: 8

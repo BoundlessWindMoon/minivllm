@@ -16,7 +16,7 @@ def apply_runtime_patches(model, cfg):
       - KIVI KV-cache backend injection
     """
     if hasattr(model, "greedy_fast_path"):
-        sampling = cfg.inference.sampling
+        sampling = cfg.generation.sampling
         if (
             sampling.sample_method == "greedy"
             and sampling.temperature == 1.0
@@ -26,7 +26,7 @@ def apply_runtime_patches(model, cfg):
             logger.info("Megakernel: enabled greedy fast path (kernel argmax only)")
 
     # Inject KV-cache backend if requested
-    kv_cfg = getattr(cfg.inference, "kv_cache", None)
+    kv_cfg = cfg.model.kv_cache
     if kv_cfg and kv_cfg.backend in ("kivi", "default"):
         from layers.kv_cache import create_kv_backend
 

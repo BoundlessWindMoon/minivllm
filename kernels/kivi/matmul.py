@@ -4,7 +4,7 @@ Adapts the reference KIVI implementation to mini-vllm's data layout.
 """
 
 import torch
-from kernels.kivi.cuda_gemv import _kivi_gemv
+from kernels.kivi.gemv_cuda import _kivi_gemv
 
 
 def kivi_bmm_fA_qB_outer(

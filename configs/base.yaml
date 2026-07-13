@@ -1,0 +1,94 @@
+# Shared hardware, algorithm, and feature-flag defaults.
+# All model configs and run configs inherit from this.
+# Do NOT put model-specific paths or generation prompts here.
+
+env:
+  device: cuda:0
+  default_dtype: bfloat16
+  distributed:
+    backend: nccl
+    init_method: tcp://localhost:29500
+    world_size: 1
+    rank: 0
+
+model:
+  backend: default
+  megakernel_variant: default
+  attention_backend: sdpa
+  use_cuda_graph: false
+  cuda_graph_bucket_size: 1
+  use_quantized_model: false
+  use_kvcache: true
+  check_correction: false
+  cpu_offload_modules: []
+  linear_attn_prefill_backend: torch
+  linear_attn_decode_backend: fla
+  kv_cache:
+    backend: default
+    max_len: 4096
+    k_bits: 2
+    v_bits: 2
+    group_size: 32
+    residual_length: 32
+
+generation:
+  prompt: "Hello"
+  max_new_tokens: 256
+  stop_on_eos: true
+  use_chat_template: false
+  use_thinking: false
+  sampling:
+    sample_method: greedy
+    temperature: 1.0
+    topk: 1
+    topp: 1.0
+  multimodal:
+    enabled: false
+    image_path: ""
+
+batch:
+  num_slots: 8
+  max_batch_size: 4
+  prompts:
+    asset: assets/prompts/default.jsonl
+    random: false
+    seed: 42
+    num_requests: 8
+
+path:
+  model_path: ""
+  data_path: ""
+  profile_dir: ./log/profile/
+  quantized_model_path: ""
+  baseline_model_path: ""
+
+quant:
+  quant_method: AWQ
+  quant_bits: 4
+  quant_targets: [MLP, ATTENTION]
+  group_size: 128
+  has_zero_point: true
+  apply_clip: true
+  export_compatible: false
+  backend: triton_wt
+  layout: Wt
+  pack_order: sequential
+  max_chunk_memory: 1073741824
+  calibration:
+    data: pileval
+    max_seq_length: 4096
+    n_samples: 32
+    split: train
+    text_column: text
+
+profiling:
+  torch_profiler:
+    enabled: false
+    profile_dir: ./log/profile/
+  swanlab:
+    enabled: false
+    project: mini-vllm
+    experiment_name: null
+  json:
+    enabled: false
+    path: ./log/profile/default.json

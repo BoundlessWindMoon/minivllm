@@ -1,0 +1,8 @@
+_base: ../runs/batch.yaml
+# Chat workload: natural conversation, moderate I/O ratio (~1:3)
+batch:
+  prompts:
+    asset: assets/prompts/chat.jsonl
+    random: true
+    seed: 42
+    num_requests: 16

@@ -1,0 +1,18 @@
+_base: ../runs/batch.yaml
+# Skewed workload: 90% short (chat+coding, ~8~200 tok) + 10% long (long_context, ~500~835 tok)
+# Designed to maximise scheduling policy differences:
+#   spf starves long requests; ljf prioritises them; fifo/random are intermediate.
+# slots=24 / max_len=1500 fits within 6GB VRAM (KV pool ~3938MB, margin ~892MB).
+model:
+  kv_cache:
+    max_len: 1500
+batch:
+  num_slots: 24
+  max_batch_size: 12
+  max_num_batched_tokens: null
+  timeout_seconds: null
+  prompts:
+    asset: assets/prompts/skewed.jsonl
+    random: true
+    seed: 42
+    num_requests: 80

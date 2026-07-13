@@ -1,0 +1,40 @@
+{"prompt": "The capital of France is", "max_new_tokens": 64}
+{"prompt": "Explain quantum entanglement in simple terms.", "max_new_tokens": 512}
+{"prompt": "Write a haiku about the moon.", "max_new_tokens": 128}
+{"prompt": "What is the difference between machine learning and deep learning?", "max_new_tokens": 512}
+{"prompt": "Translate to Chinese: The weather is nice today.", "max_new_tokens": 64}
+{"prompt": "Once upon a time in a kingdom far away,", "max_new_tokens": 256}
+{"prompt": "写一首关于春天的短诗。", "max_new_tokens": 256}
+{"prompt": "Python 中列表和元组的区别是什么？", "max_new_tokens": 512}
+{"prompt": "Summarize the plot of Romeo and Juliet in two sentences.", "max_new_tokens": 128}
+{"prompt": "What are the main causes of climate change?", "max_new_tokens": 512}
+{"prompt": "如何学好一门外语？给我一些实用建议。", "max_new_tokens": 512}
+{"prompt": "Describe the process of photosynthesis.", "max_new_tokens": 256}
+{"prompt": "Write a short story opening: It was a dark and stormy night when", "max_new_tokens": 256}
+{"prompt": "给我讲个关于程序员的笑话。", "max_new_tokens": 128}
+{"prompt": "What is the time complexity of quicksort?", "max_new_tokens": 256}
+{"prompt": "北京有哪些必去的旅游景点？", "max_new_tokens": 512}
+{"prompt": "Explain the difference between TCP and UDP.", "max_new_tokens": 512}
+{"prompt": "为什么天空是蓝色的？", "max_new_tokens": 256}
+{"prompt": "Write a product description for a smart water bottle.", "max_new_tokens": 256}
+{"prompt": "什么是注意力机制？用简单的语言解释。", "max_new_tokens": 512}
+{"prompt": "List five uses of artificial intelligence in healthcare.", "max_new_tokens": 256}
+{"prompt": "请推荐三本适合初学者的Python书籍。", "max_new_tokens": 256}
+{"prompt": "What is the difference between supervised and unsupervised learning?", "max_new_tokens": 512}
+{"prompt": "用一段话介绍一下长城。", "max_new_tokens": 256}
+{"prompt": "How does a neural network learn?", "max_new_tokens": 512}
+{"prompt": "给我写一封申请实习的邮件模板。", "max_new_tokens": 512}
+{"prompt": "What is the Turing test?", "max_new_tokens": 256}
+{"prompt": "解释一下什么是大语言模型。", "max_new_tokens": 512}
+{"prompt": "Describe the water cycle in simple terms.", "max_new_tokens": 256}
+{"prompt": "人工智能会取代人类的工作吗？谈谈你的看法。", "max_new_tokens": 512}
+{"prompt": "What programming languages are commonly used for data science?", "max_new_tokens": 256}
+{"prompt": "简单解释一下 Transformer 架构。", "max_new_tokens": 512}
+{"prompt": "Write a function in Python to reverse a string.", "max_new_tokens": 256}
+{"prompt": "中国的四大发明是什么？", "max_new_tokens": 256}
+{"prompt": "What is gradient descent and how does it work?", "max_new_tokens": 512}
+{"prompt": "给我讲讲量子计算的基本原理。", "max_new_tokens": 512}
+{"prompt": "Name three benefits of regular exercise.", "max_new_tokens": 128}
+{"prompt": "如何缓解工作压力？", "max_new_tokens": 256}
+{"prompt": "Explain what an API is to a non-technical person.", "max_new_tokens": 256}
+{"prompt": "为什么睡眠对健康很重要？", "max_new_tokens": 256}

@@ -10,7 +10,7 @@ def load_processor(cfg):
 
     Returns None when multimodal is disabled.
     """
-    if getattr(cfg.inference, "multimodal", None) and cfg.inference.multimodal.enabled:
+    if cfg.generation.multimodal.enabled:
         processor = AutoProcessor.from_pretrained(
             cfg.path.model_path, trust_remote_code=True
         )

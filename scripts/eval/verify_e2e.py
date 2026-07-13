@@ -30,13 +30,13 @@ PROMPTS = [
 def run_once(cfg_path: str, prompt: str, max_new_tokens: int = 16):
     """Load model and run one inference. Returns generated text."""
     cfg = GlobalConfig.from_yaml(cfg_path)
-    cfg.inference.prompt = prompt
-    cfg.inference.max_new_tokens = max_new_tokens
-    cfg.inference.sampling.sample_method = "greedy"
-    cfg.inference.sampling.temperature = 1.0
-    cfg.inference.sampling.topp = 1.0
-    cfg.inference.stop_on_eos = True
-    cfg.inference.use_cuda_graph = False
+    cfg.generation.prompt = prompt
+    cfg.generation.max_new_tokens = max_new_tokens
+    cfg.generation.sampling.sample_method = "greedy"
+    cfg.generation.sampling.temperature = 1.0
+    cfg.generation.sampling.topp = 1.0
+    cfg.generation.stop_on_eos = True
+    cfg.model.use_cuda_graph = False
 
     torch.set_default_dtype(cfg.env.get_torch_dtype())
     torch.set_default_device(cfg.env.device)

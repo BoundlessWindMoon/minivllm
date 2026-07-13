@@ -28,11 +28,14 @@ A lightweight inference and quantization engine for studying LLMs.
 
 ## Features
 
-- **Fused CUDA Megakernel** -- single-kernel decode pipeline fusing embedding, all transformer layers, norm and LM head
-- **CUDA Graph Decode** -- configurable bucketed CUDA Graphs to eliminate CPU launch overhead
-- **AWQ 4-bit Quantization** -- built-in calibration and inference with Triton/CUDA kernels
-- **SwanLab Monitoring** -- real-time throughput and memory tracking ([docs](docs/profiling.md))
-- **lm-eval Benchmark** -- built-in evaluation harness adapter ([docs](docs/benchmark.md))
+- **Continuous Batching** -- dynamic scheduler with FIFO / SPF / LJF / random admission and chunked prefill
+- **Flash Attention** -- varlen FA2 prefill, `flash_attn_with_kvcache` decode, SDPA fallback
+- **Fused CUDA Megakernel** -- single-kernel decode fusing all transformer layers (bs=1)
+- **CUDA Graph Decode** -- bucketed graph capture to reduce CPU launch overhead (bs=1)
+- **KV Cache Quantization (KIVI)** -- 2/4-bit asymmetric quantization with full-precision residual window
+- **AWQ 4-bit Quantization** -- weight-only quantization with Triton/CUDA kernels
+- **SwanLab Monitoring** -- throughput and memory tracking ([docs](docs/profiling.md))
+- **lm-eval Benchmark** -- evaluation harness adapter ([docs](docs/benchmark.md))
 
 ## Supported Models
 
@@ -55,33 +58,46 @@ source .venv/bin/activate
 # PyTorch (match your CUDA version)
 uv pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128
 
-# Core
+# Core dependencies
 uv pip install -e .
+```
 
-# Optional: flash-attn, lm-eval, swanlab, etc.
-uv pip install -e ".[all]"
+**Optional extras:**
 
-# flash-linear-attention (required for Qwen3.5 linear attention)
+```bash
+# Qwen3.5: flash-attn and flash-linear-attention are required
+pip install flash-attn --no-build-isolation
 pip install flash-linear-attention --no-build-isolation
+
+uv pip install -e ".[benchmark]"   # lm-eval
+uv pip install -e ".[monitor]"     # SwanLab
+uv pip install -e ".[quant]"       # AWQ
 ```
 
 ### 2. Download Model
 
 ```bash
-HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen3-0.6B --local-dir ~/huggingface/Qwen3-0.6B/
+HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen3-0.6B \
+  --local-dir ~/huggingface/Qwen3-0.6B/
 
-# Optional: Qwen3.5 (multimodal, requires flash-linear-attention)
-HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen3.5-0.8B --local-dir ~/huggingface/Qwen3.5-0.8B/
+# Qwen3.5 requires flash-attn + flash-linear-attention
+HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen3.5-0.8B \
+  --local-dir ~/huggingface/Qwen3.5-0.8B/
 ```
 
 ### 3. Run
 
 ```bash
-# Qwen3 with megakernel backend
+# Qwen3, megakernel backend
 python main.py
 
-# Qwen3.5 with cuda graph
+# Qwen3.5, CUDA Graph (requires flash-attn + flash-linear-attention)
 python main.py --config configs/qwen3_5.yaml
+
+# Continuous batching
+python batch_main.py
+python batch_main.py --sweep-policies fifo spf ljf random
+python batch_main.py --repeat 5
 ```
 
 ### 4. Benchmark
@@ -104,15 +120,18 @@ See [docs/benchmark.md](docs/benchmark.md) for task customization and log output
 ```text
 mini-vllm/
 ├── configs/            # YAML configs
-├── engine/             # Inference loop, model runner, sampler
-├── kernels/            # Triton & CUDA kernels
-├── layers/             # Attention, MLP, RMSNorm, Rotary
+├── engine/             # Inference loop, model runner, scheduler, batched runner, KV pool
+├── kernels/            # Triton & CUDA kernels (AWQ, KIVI)
+├── layers/             # Attention, MLP, RMSNorm, Rotary, KV cache backends
 ├── model/              # Qwen3 / Qwen3.5 architectures
 ├── quantization/       # AWQ calibration and quantized layers
 ├── eval/               # lm-eval adapter
 ├── scripts/            # Benchmark, verify, profile tools
-├── main.py             # Entry point: inference
-└── quant.py            # Entry point: AWQ calibration
+├── test/               # Functional test suite (pytest)
+├── assets/prompts/     # JSONL prompt workloads for batch testing
+├── main.py             # Entry point: single-request inference
+├── batch_main.py       # Entry point: continuous batching
+└── quant_cli.py        # Entry point: AWQ calibration
 ```
 
 ## Acknowledgements

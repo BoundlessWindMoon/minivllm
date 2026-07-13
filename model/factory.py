@@ -131,5 +131,16 @@ def _register_qwen3_5() -> None:
     )
 
 
+def _register_qwen3_moe() -> None:
+    from model.qwen3_moe import Qwen3MoeForCausalLM
+
+    register_model(
+        "qwen3_moe",
+        torch_factory=_default_torch_factory(Qwen3MoeForCausalLM),
+        megakernel_factory=None,
+    )
+
+
 _register_qwen3()
 _register_qwen3_5()
+# _register_qwen3_moe()

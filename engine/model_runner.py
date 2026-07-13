@@ -1,6 +1,8 @@
 """ModelRunner: orchestrates prefill, decode, CUDA graph, and sampling."""
 
 import os
+from typing import Iterator, Optional
+
 import torch
 
 from utils.logger import logger
@@ -8,6 +10,7 @@ from engine.context import get_context, set_context
 from engine.progress import InferenceProgress, _NoOpProgress
 from engine.profiler import build_profiler
 from engine.sampler import Sampler
+from engine.schema import SamplingParams, GenerationOutput
 from utils.config import GlobalConfig
 
 
@@ -25,56 +28,16 @@ class ModelRunner:
         self.processor = processor
 
         self.device = cfg.env.device
-        self.max_new_tokens = cfg.inference.max_new_tokens
-        self.use_kvcache = cfg.inference.use_kvcache
-        self.stop_on_eos = getattr(cfg.inference, "stop_on_eos", True)
+        self.max_new_tokens = cfg.generation.max_new_tokens
+        self.use_kvcache = cfg.model.use_kvcache
+        self.stop_on_eos = cfg.generation.stop_on_eos
         self.eos_token_ids = self._collect_eos_ids() if self.stop_on_eos else set()
 
         self.use_progress = True
-
-        self.prompt = cfg.inference.prompt
-        use_chat = getattr(cfg.inference, "use_chat_template", False)
-        use_thinking = getattr(cfg.inference, "use_thinking", True)
-        has_tmpl = getattr(self.tokenizer, "chat_template", None) is not None
-
-        multimodal_cfg = getattr(cfg.inference, "multimodal", None)
-        self._multimodal_enabled = (
-            multimodal_cfg is not None
-            and multimodal_cfg.enabled
-            and processor is not None
-        )
         self._multimodal_kwargs = {}
 
-        if self._multimodal_enabled:
-            logger.info("Multimodal inference enabled.")
-            self._prepare_multimodal_inputs(multimodal_cfg, use_thinking)
-        else:
-            if use_chat and has_tmpl:
-                chat_inputs = self.tokenizer.apply_chat_template(
-                    [{"role": "user", "content": self.prompt}],
-                    add_generation_prompt=True,
-                    enable_thinking=use_thinking,
-                    return_tensors="pt",
-                )
-                self.input_ids = chat_inputs["input_ids"].to(self.device)
-            else:
-                if use_chat and not has_tmpl:
-                    logger.warning(
-                        "use_chat_template=True but tokenizer has no chat_template; "
-                        "falling back to raw tokenization."
-                    )
-                inputs = self.tokenizer(self.prompt, return_tensors="pt").to(
-                    self.device
-                )
-                self.input_ids = inputs["input_ids"].to(self.device)
-            self.position_ids = torch.arange(
-                self.input_ids.shape[1], device=self.device
-            ).unsqueeze(0)
-
-        self.use_cuda_graph = getattr(cfg.inference, "use_cuda_graph", False)
-        self._cuda_graph_bucket_size = getattr(
-            cfg.inference, "cuda_graph_bucket_size", 1
-        )
+        self.use_cuda_graph = cfg.model.use_cuda_graph
+        self._cuda_graph_bucket_size = cfg.model.cuda_graph_bucket_size
         if self._cuda_graph_bucket_size < 1:
             self._cuda_graph_bucket_size = 1
         self._setup_attention_bucket_mode(
@@ -119,7 +82,7 @@ class ModelRunner:
                         "[CUDA Graph] Enabled for decode phase (exact per-step)."
                     )
 
-        sampling_cfg = cfg.inference.sampling
+        sampling_cfg = cfg.generation.sampling
         self.sampler = Sampler(
             sampling_cfg.sample_method,
             sampling_cfg.temperature,
@@ -250,8 +213,6 @@ class ModelRunner:
         # ==========================================
         # 2. Decode
         # ==========================================
-        current_tokens = 0
-        stopped_by_eos = next_token.item() in self.eos_token_ids
 
         if self.use_cuda_graph:
             self._decode_input_ids.copy_(next_token.reshape(1, 1))
@@ -262,25 +223,53 @@ class ModelRunner:
                 self._capture_all_decode_graphs(past_len, max_new_tokens, pbar)
                 pbar.end_warmup()
 
-        pbar.start_decode()
-        while current_tokens < max_new_tokens and not stopped_by_eos:
-            logits = self.run_decode(next_token, past_len)
-            next_token = self.sampler.sample(logits)
-            generated_ids.append(next_token.item())
-            past_len += 1
-            current_tokens += 1
-            pbar.step_decode(next_token.item())
-            if next_token.item() in self.eos_token_ids:
-                stopped_by_eos = True
+        for _, token_id, is_finished, _ in self._run_decode_loop(
+            next_token, past_len, max_new_tokens, self.sampler, self.eos_token_ids, pbar
+        ):
+            generated_ids.append(token_id)
+            if is_finished:
                 break
 
         return torch.tensor([generated_ids], device=self.device, dtype=torch.long)
 
     @torch.inference_mode()
-    def inference(self) -> str:
+    def inference(self, prompt: Optional[str] = None) -> str:
+        prompt = prompt or self.cfg.generation.prompt
+        use_chat = self.cfg.generation.use_chat_template
+        use_thinking = self.cfg.generation.use_thinking
+        has_tmpl = getattr(self.tokenizer, "chat_template", None) is not None
+
+        multimodal_cfg = self.cfg.generation.multimodal
+        multimodal_enabled = (
+            multimodal_cfg is not None
+            and multimodal_cfg.enabled
+            and self.processor is not None
+        )
+
+        if multimodal_enabled:
+            self._prepare_multimodal_inputs(multimodal_cfg, use_thinking)
+            input_ids = self.input_ids
+        else:
+            if use_chat and has_tmpl:
+                chat_inputs = self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    add_generation_prompt=True,
+                    enable_thinking=use_thinking,
+                    return_tensors="pt",
+                )
+                input_ids = chat_inputs["input_ids"].to(self.device)
+            else:
+                if use_chat and not has_tmpl:
+                    logger.warning(
+                        "use_chat_template=True but tokenizer has no chat_template; "
+                        "falling back to raw tokenization."
+                    )
+                input_ids = self.tokenizer(prompt, return_tensors="pt")[
+                    "input_ids"
+                ].to(self.device)
+
         max_new_tokens = self.max_new_tokens
         tokenizer = self.tokenizer
-        input_ids = self.input_ids
         prompt_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
         with InferenceProgress(tokenizer, max_new_tokens, prompt_text) as pbar:
             with self.profiler.scope("decode"):
@@ -296,6 +285,95 @@ class ModelRunner:
             input_ids[0], skip_special_tokens=True
         ) + tokenizer.decode(generated_ids, skip_special_tokens=True)
         return text
+
+    def _tokenize_prompt(self, prompt: str, enable_thinking: Optional[bool] = None) -> torch.Tensor:
+        use_chat = self.cfg.generation.use_chat_template
+        if enable_thinking is None:
+            enable_thinking = self.cfg.generation.use_thinking
+        has_tmpl = getattr(self.tokenizer, "chat_template", None) is not None
+        if use_chat and has_tmpl:
+            return self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+                return_tensors="pt",
+            )["input_ids"].to(self.device)
+        return self.tokenizer(prompt, return_tensors="pt")["input_ids"].to(self.device)
+
+    def _run_decode_loop(
+        self,
+        first_token: torch.Tensor,
+        past_len: int,
+        max_new_tokens: int,
+        sampler: Sampler,
+        eos_ids: set,
+        pbar=None,
+    ) -> Iterator[tuple]:
+        """Shared decode loop. Yields (next_token_tensor, token_id, is_finished, finish_reason).
+
+        Caller is responsible for prefill and CUDA graph pre-capture before calling this.
+        """
+        if pbar is None:
+            pbar = _NoOpProgress()
+
+        next_token = first_token
+        pbar.start_decode()
+        for step in range(max_new_tokens):
+            logits = self.run_decode(next_token, past_len)
+            next_token = sampler.sample(logits)
+            token_id = next_token.item()
+            past_len += 1
+            pbar.step_decode(token_id)
+            is_eos = token_id in eos_ids
+            is_last = step == max_new_tokens - 1
+            is_finished = is_eos or is_last
+            finish_reason = "eos" if is_eos else ("length" if is_last else None)
+            yield next_token, token_id, is_finished, finish_reason
+            if is_finished:
+                break
+
+    @torch.inference_mode()
+    def generate_stream(
+        self,
+        prompt: str,
+        sampling_params: SamplingParams,
+    ) -> Iterator[tuple]:
+        """Thin wrapper: tokenise → prefill → _run_decode_loop → yield formatted tokens.
+
+        Yields (token_id, text_delta, is_finished, finish_reason) per token.
+        """
+        input_ids = self._tokenize_prompt(prompt, sampling_params.enable_thinking)
+        sampler = Sampler(
+            sample_method="greedy" if sampling_params.temperature == 0.0 else "sample",
+            temperature=sampling_params.temperature,
+            top_k=sampling_params.top_k,
+            top_p=sampling_params.top_p,
+        )
+        max_new_tokens = sampling_params.max_new_tokens
+        eos_ids = self.eos_token_ids if sampling_params.stop_on_eos else set()
+        prompt_len = input_ids.shape[1]
+
+        # Prefill
+        position_ids = torch.arange(prompt_len, device=self.device).unsqueeze(0)
+        cu_seqlens_q = torch.tensor([0, prompt_len], dtype=torch.long, device=self.device)
+        set_context(is_prefill=True, cache_len=0, cu_seqlens_q=cu_seqlens_q)
+        logits = self.run(input_ids, position_ids)
+        first_token = sampler.sample(logits)
+        token_id = first_token.item()
+        text_delta = self.tokenizer.decode([token_id], skip_special_tokens=True)
+        is_eos = token_id in eos_ids
+        yield token_id, text_delta, is_eos, ("eos" if is_eos else None)
+        if is_eos:
+            return
+
+        # Decode
+        for _, token_id, is_finished, finish_reason in self._run_decode_loop(
+            first_token, prompt_len, max_new_tokens - 1, sampler, eos_ids
+        ):
+            text_delta = self.tokenizer.decode([token_id], skip_special_tokens=True)
+            yield token_id, text_delta, is_finished, finish_reason
+            if is_finished:
+                break
 
     def _cache_len_to_bucket(self, cache_len: int) -> int:
         """Map a cache_len to its bucket key for CUDA Graph sharing.
@@ -441,15 +519,6 @@ class ModelRunner:
         **kwargs,
     ) -> torch.Tensor:
         return self.model(input_ids, position_ids, **kwargs)
-
-    def post_process(
-        self, input_ids: torch.Tensor, position_ids: torch.Tensor, logits: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-        new_input_ids = torch.cat([input_ids, next_token], dim=-1)
-        new_position_ids = position_ids[:, -1:] + 1
-        new_position_ids = torch.cat([position_ids, new_position_ids], dim=-1)
-        return new_input_ids, new_position_ids
 
     def _collect_eos_ids(self) -> set[int]:
         """Union EOS ids from model.config.eos_token_id and tokenizer.eos_token_id."""

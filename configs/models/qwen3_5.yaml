@@ -1,0 +1,27 @@
+_base: ../base.yaml
+
+# Qwen3.5 family (0.8B / 3B / 7B / 14B / 32B / 72B).
+# Uses flash_attn and FLA linear-attention backends.
+
+path:
+  model_path: ~/huggingface/Qwen3.5-0.8B/
+  quantized_model_path: ~/huggingface/Qwen3.5-0.8B-AWQ_Cached
+  baseline_model_path: ~/huggingface/baseline/
+
+model:
+  attention_backend: flash_attn
+  linear_attn_prefill_backend: fla
+  linear_attn_decode_backend: fla
+  kv_cache:
+    backend: kivi
+    k_bits: 2
+    v_bits: 2
+    group_size: 32
+    residual_length: 32
+
+generation:
+  use_chat_template: true
+  use_thinking: true
+  multimodal:
+    enabled: false
+    image_path: ""

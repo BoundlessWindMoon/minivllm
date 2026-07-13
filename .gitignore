@@ -6,3 +6,9 @@ swanlog/
 *.pyc
 *.egg-info
 eval/results/
+results/
+engine.zip
+__pycache__/
+.pytest_cache/
+*.pth
+*.bin
