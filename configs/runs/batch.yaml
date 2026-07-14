@@ -26,9 +26,9 @@ batch:
   # null = disabled (full prompt processed in one step).
   # Set to e.g. 512 to enable vLLM-style chunked prefill.
   max_num_batched_tokens: null
-  timeout_seconds: 60
+  timeout_seconds: null
   prompts:
     asset: assets/prompts/default.jsonl
     random: true
     seed: 42
-    num_requests: 16
+    num_requests: 8

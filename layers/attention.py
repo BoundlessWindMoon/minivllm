@@ -225,36 +225,20 @@ class Attention(nn.Module):
         self._store_kv(k, v, cache_len, seq_len, is_prefill)
         total_len = cache_len + seq_len
 
-        # Batch prefill: varlen flash attention to avoid padding cost.
+        # Batch prefill: flash_attn_with_kvcache.
+        # KV pool already has full history + current chunk (written above).
+        # cache_seqlens = history_len + chunk_len = total tokens each seq can attend.
         if self.kv_backend is not None and is_prefill and _USE_FA_PREFILL and ctx.cu_seqlens_q is not None:
-            batch, heads, max_chunk, dim = q.shape
-            kv_heads = k.shape[1]
-
-            cu_q = ctx.cu_seqlens_q
-            seq_idx = torch.arange(max_chunk, device=q.device).unsqueeze(0)
-            lengths = (cu_q[1:] - cu_q[:-1]).unsqueeze(1)
-            mask = seq_idx < lengths  # (B, max_chunk)
-
-            q_unpad, idx_q, cu_q2, max_sq, _ = _unpad_input(
-                q.permute(0, 2, 1, 3).reshape(batch, max_chunk, heads * dim), mask
-            )
-            k_unpad, _,     cu_k2, max_sk, _ = _unpad_input(
-                k.permute(0, 2, 1, 3).reshape(batch, max_chunk, kv_heads * dim), mask
-            )
-            v_unpad, _,     _,     _,     _ = _unpad_input(
-                v.permute(0, 2, 1, 3).reshape(batch, max_chunk, kv_heads * dim), mask
-            )
-
-            o_unpad = _fa_varlen(
-                q_unpad.view(-1, heads, dim),
-                k_unpad.view(-1, kv_heads, dim),
-                v_unpad.view(-1, kv_heads, dim),
-                cu_q2, cu_k2, int(max_sq), int(max_sk),
+            k_cache, v_cache = self.kv_backend.load_kv_for_fa_decode()  # (B, max_seq, kv_h, d)
+            chunk_lens    = (ctx.cu_seqlens_q[1:] - ctx.cu_seqlens_q[:-1]).to(torch.int32)  # (B,)
+            cache_seqlens = (ctx.cache_lens + chunk_lens).to(torch.int32)                    # (B,)
+            return flash_attn_with_kvcache(
+                q.permute(0, 2, 1, 3),   # (B, chunk_len, h, d) — padded to max_chunk
+                k_cache, v_cache,
+                cache_seqlens=cache_seqlens,
                 softmax_scale=self.scale,
                 causal=True,
             )
-            o_pad = _pad_input(o_unpad.view(-1, heads * dim), idx_q, batch, max_chunk)
-            return o_pad.view(batch, max_chunk, heads, dim)
 
         # Batch decode: flash_attn_with_kvcache attends each sequence to its own depth.
         if self.kv_backend is not None and not is_prefill and _USE_FA_DECODE:
