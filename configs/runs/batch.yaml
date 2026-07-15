@@ -5,7 +5,7 @@ _base: ../models/qwen3.yaml
 
 model:
   backend: default
-  use_cuda_graph: false
+  use_cuda_graph: true
   kv_cache:
     backend: default
 

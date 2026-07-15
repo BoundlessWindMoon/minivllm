@@ -140,6 +140,13 @@ class Attention(nn.Module):
             return self.k_cache[:, :, :total_len], self.v_cache[:, :, :total_len]
 
     def _compute(self, q, k, v, is_prefill, cache_len, attn_mask=None):
+        # k/v may come from the KV pool with a different dtype than q (e.g.
+        # pool stores bfloat16 while activations are float32). Run attention in
+        # k.dtype (bfloat16) and cast the output back to q.dtype so the rest
+        # of the model (o_proj, layernorm, …) stays in activation dtype.
+        orig_dtype = q.dtype
+        if k.dtype != q.dtype:
+            q = q.to(k.dtype)
         n_rep = self.num_heads // self.num_kv_heads
         if n_rep > 1:
             k = k.repeat_interleave(n_rep, dim=1)
@@ -158,7 +165,7 @@ class Attention(nn.Module):
                     o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
             else:
                 if self.use_cuda_graph_bucket:
-                    o = F.scaled_dot_product_attention(q, k, v, attn_mask=self._attn_mask)
+                    o = F.scaled_dot_product_attention(q, k, v, attn_mask=self._attn_mask.to(q.dtype))
                 else:
                     o = F.scaled_dot_product_attention(q, k, v, is_causal=False)
         else:
@@ -172,11 +179,11 @@ class Attention(nn.Module):
                 )
                 attn_weights = attn_weights.masked_fill(causal_mask, float("-inf"))
             elif self.use_cuda_graph_bucket:
-                attn_weights = attn_weights + self._attn_mask
+                attn_weights = attn_weights + self._attn_mask.to(attn_weights.dtype)
             attn_weights = torch.softmax(attn_weights, dim=-1)
             o = torch.matmul(attn_weights, v)
 
-        return o
+        return o.to(orig_dtype)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, use_cache: bool = True):
         if not use_cache:
@@ -229,26 +236,35 @@ class Attention(nn.Module):
         # KV pool already has full history + current chunk (written above).
         # cache_seqlens = history_len + chunk_len = total tokens each seq can attend.
         if self.kv_backend is not None and is_prefill and _USE_FA_PREFILL and ctx.cu_seqlens_q is not None:
-            k_cache, v_cache = self.kv_backend.load_kv_for_fa_decode()  # (B, max_seq, kv_h, d)
-            chunk_lens    = (ctx.cu_seqlens_q[1:] - ctx.cu_seqlens_q[:-1]).to(torch.int32)  # (B,)
-            cache_seqlens = (ctx.cache_lens + chunk_lens).to(torch.int32)                    # (B,)
-            return flash_attn_with_kvcache(
-                q.permute(0, 2, 1, 3),   # (B, chunk_len, h, d) — padded to max_chunk
-                k_cache, v_cache,
+            k_cache, v_cache = self.kv_backend.load_kv_for_fa_decode()
+            chunk_lens    = (ctx.cu_seqlens_q[1:] - ctx.cu_seqlens_q[:-1]).to(torch.int32)
+            cache_seqlens = (ctx.cache_lens + chunk_lens).to(torch.int32)
+            q_fa = q.permute(0, 2, 1, 3).to(k_cache.dtype)
+            bt = ctx.block_tables  # (B, pages_per_seq) int32, or None for dense pool
+            out = flash_attn_with_kvcache(
+                q_fa, k_cache, v_cache,
+                block_table=bt,
                 cache_seqlens=cache_seqlens,
                 softmax_scale=self.scale,
                 causal=True,
             )
+            return out.to(q.dtype)
 
-        # Batch decode: flash_attn_with_kvcache attends each sequence to its own depth.
+        # Batch decode: flash_attn_with_kvcache with paged block_table.
         if self.kv_backend is not None and not is_prefill and _USE_FA_DECODE:
             k_cache, v_cache = self.kv_backend.load_kv_for_fa_decode()
-            return flash_attn_with_kvcache(
-                q.permute(0, 2, 1, 3), k_cache, v_cache,
-                cache_seqlens=(ctx.cache_lens + 1).to(torch.int32),
+            # seq_lens = cache_lens + 1 (include the token written this step)
+            seq_lens = ctx.seq_lens if ctx.seq_lens is not None else (ctx.cache_lens + 1).to(torch.int32)
+            bt = ctx.block_tables
+            q_dec = q.permute(0, 2, 1, 3).to(k_cache.dtype)
+            out = flash_attn_with_kvcache(
+                q_dec, k_cache, v_cache,
+                block_table=bt,
+                cache_seqlens=seq_lens,
                 softmax_scale=self.scale,
                 causal=False,
             )
+            return out.to(q.dtype)
 
         k_for_attn, v_for_attn = self._load_kv(total_len, is_prefill, k, v)
         return self._compute(q, k_for_attn, v_for_attn, is_prefill, cache_len, attn_mask).transpose(1, 2)

@@ -19,6 +19,18 @@ class Context:
     max_seqlen_q: int = 0
     max_seqlen_k: int = 0
 
+    # CUDA graph batch decode: number of real requests in the padded batch.
+    num_real_reqs: int | None = None
+
+    # Paged KV decode: block_table (bs, pages_per_seq) int32 and
+    # seq_lens (bs,) int32 — total KV tokens per sequence including current.
+    block_tables: torch.Tensor | None = None
+    seq_lens: torch.Tensor | None = None
+
+    # (reserved for future use)
+    static_k_caches: list[torch.Tensor] | None = None
+    static_v_caches: list[torch.Tensor] | None = None
+
 
 _CONTEXT = Context()
 
@@ -37,6 +49,11 @@ def set_context(
     cu_seqlens_k: torch.Tensor | None = None,
     max_seqlen_q: int = 0,
     max_seqlen_k: int = 0,
+    num_real_reqs: int | None = None,
+    block_tables: torch.Tensor | None = None,
+    seq_lens: torch.Tensor | None = None,
+    static_k_caches: list[torch.Tensor] | None = None,
+    static_v_caches: list[torch.Tensor] | None = None,
 ) -> None:
     global _CONTEXT
     _CONTEXT = Context(
@@ -49,6 +66,11 @@ def set_context(
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
+        num_real_reqs=num_real_reqs,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        static_k_caches=static_k_caches,
+        static_v_caches=static_v_caches,
     )
 
 

@@ -73,9 +73,8 @@ def main():
         print(dump_config(cfg))
         return
 
-    cfg.model.backend           = "default"
-    cfg.model.use_cuda_graph    = False
-    cfg.model.kv_cache.backend  = "default"
+    cfg.model.backend          = "default"
+    cfg.model.kv_cache.backend = "default"
 
     torch.set_default_dtype(cfg.env.get_torch_dtype())
     torch.set_default_device(cfg.env.device)

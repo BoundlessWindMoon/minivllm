@@ -90,6 +90,9 @@ class ModelConfig:
     attention_backend: str = "sdpa"               # "sdpa" | "flash_attn" | "naive"
     use_cuda_graph: bool = False
     cuda_graph_bucket_size: int = 1
+    # Max batch size to capture CUDA graphs for in BatchedModelRunner.
+    # None = auto (uses batch.max_batch_size). Only applies when use_cuda_graph=True.
+    cuda_graph_max_batch_size: int | None = None
     use_quantized_model: bool = False
     use_kvcache: bool = True
     check_correction: bool = False
