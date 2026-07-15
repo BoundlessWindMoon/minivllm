@@ -12,10 +12,11 @@ A lightweight inference and quantization engine for studying LLMs.
 
 > Measured on RTX 4050 6 GB · greedy · 128 decode tokens
 
-| Model | HF Transformers | mini-vllm | Speedup |
-|-------|----------------|-----------|---------|
-| Qwen3-0.6B | 23.0 tok/s | 114.5 tok/s (megakernel) | **5.0x** |
-| Qwen3.5-0.8B | 15.3 tok/s | 90.9 tok/s (CUDA Graph + flash-attn + fla) | **6.0x** |
+| Mode | Model | HF Transformers | mini-vllm | Speedup |
+|------|-------|----------------|-----------|---------|
+| Single-request | Qwen3-0.6B | 23.0 tok/s | 114.5 tok/s (megakernel) | **5.0x** |
+| Single-request | Qwen3.5-0.8B | 15.3 tok/s | 90.9 tok/s (CUDA Graph + flash-attn + fla) | **6.0x** |
+| Batch (bs=8) | Qwen3-0.6B | — | 110 tok/s (paged KV + CUDA Graph) | — |
 
 ## Streaming Inference & Megakernel 
 
@@ -29,9 +30,10 @@ A lightweight inference and quantization engine for studying LLMs.
 ## Features
 
 - **Continuous Batching** -- dynamic scheduler with FIFO / SPF / LJF / random admission and chunked prefill
-- **Flash Attention** -- varlen FA2 prefill, `flash_attn_with_kvcache` decode, SDPA fallback
+- **Paged KV Cache** -- FA2 paged attention (`block_table`-based), eliminates full-sequence KV gather at decode
+- **Multi-batch CUDA Graph** -- bucketed graph capture across batch sizes [1,2,4,8,...]; decode replay with static paged buffers
+- **Flash Attention** -- varlen FA2 prefill, `flash_attn_with_kvcache` paged decode, SDPA fallback
 - **Fused CUDA Megakernel** -- single-kernel decode fusing all transformer layers (bs=1)
-- **CUDA Graph Decode** -- bucketed graph capture to reduce CPU launch overhead (bs=1)
 - **KV Cache Quantization (KIVI)** -- 2/4-bit asymmetric quantization with full-precision residual window
 - **AWQ 4-bit Quantization** -- weight-only quantization with Triton/CUDA kernels
 - **SwanLab Monitoring** -- throughput and memory tracking ([docs](docs/profiling.md))
