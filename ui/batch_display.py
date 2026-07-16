@@ -178,7 +178,7 @@ def run_batch_with_display(
             if timeout_seconds and (time.perf_counter() - t0) > timeout_seconds:
                 print(f"\n[yellow]Timeout ({timeout_seconds:.0f}s): stopping early.[/yellow]")
                 break
-            finished    = runner.step()
+            finished, _ = runner.step()
             total_toks += sum(r.num_generated_tokens for r in finished)
             step       += 1
 

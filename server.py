@@ -1,7 +1,7 @@
 """mini-vllm HTTP server — OpenAI-compatible /v1/chat/completions.
 
 Start with:
-    python scripts/start_server.py --config configs/default.yaml
+    python scripts/serve/start_server.py --config configs/runs/batch.yaml
 """
 
 import time
@@ -15,11 +15,10 @@ from typing import Optional
 
 from utils.config import GlobalConfig, print_runtime_config
 from utils.logger import logger
-from engine.loader import load_model
-from engine.runtime_setup import apply_runtime_patches
-from engine.processor import load_processor
-from engine.model_runner import ModelRunner
-from engine.async_engine import AsyncLLMEngine
+from engine.loader import load_model, build_kv_pool
+from engine.scheduler import Scheduler
+from engine.batched_runner import BatchedModelRunner
+from engine.batch_async_engine import BatchAsyncEngine
 from engine.schema import SamplingParams
 
 
@@ -88,20 +87,38 @@ class ChatCompletionResponse(BaseModel):
 # App state
 # ---------------------------------------------------------------------------
 
-_engine: Optional[AsyncLLMEngine] = None
+_engine: Optional[BatchAsyncEngine] = None
 _cfg: Optional[GlobalConfig] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # This runs at startup; parse args here so uvicorn.run() can still be called
-    # from __main__ after argparse.
     global _engine, _cfg
+
+    # Force batch backend — megakernel is bs=1 only.
+    _cfg.model.backend = "default"
+    _cfg.model.kv_cache.backend = "default"
+
     model, tokenizer = load_model(_cfg)
-    model = apply_runtime_patches(model, _cfg)
-    processor = load_processor(_cfg)
-    runner = ModelRunner(model=model, tokenizer=tokenizer, processor=processor, cfg=_cfg)
-    _engine = AsyncLLMEngine(runner)
+
+    pool = build_kv_pool(model, _cfg)
+    model.attach_kv_pool(pool)
+
+    scheduler = Scheduler(
+        pool,
+        max_batch_size=_cfg.batch.max_batch_size,
+        admission_policy=_cfg.batch.admission_policy,
+        max_num_batched_tokens=_cfg.batch.max_num_batched_tokens,
+    )
+    runner = BatchedModelRunner(model, tokenizer, pool, scheduler, _cfg)
+
+    # Warmup so CUDA graphs are captured before the first real request.
+    logger.info("Warming up BatchedModelRunner...")
+    runner.warmup(prompt_tokens=64, decode_steps=3)
+    pool.reset()
+    logger.info("Warmup done.")
+
+    _engine = BatchAsyncEngine(runner, scheduler, tokenizer)
     logger.info("Server ready.")
     yield
     _engine.shutdown()
@@ -125,9 +142,7 @@ async def chat_completions(request: ChatCompletionRequest):
     if _engine is None:
         raise HTTPException(status_code=503, detail="Engine not initialised")
 
-    # Build prompt from messages (apply chat template via engine's runner tokenizer)
-    runner = _engine._runner
-    tokenizer = runner.tokenizer
+    tokenizer = _engine._tokenizer
     has_tmpl = getattr(tokenizer, "chat_template", None) is not None
 
     messages = [{"role": m.role, "content": m.content} for m in request.messages]
@@ -137,15 +152,15 @@ async def chat_completions(request: ChatCompletionRequest):
         else _cfg.generation.use_thinking
     )
     if has_tmpl:
-        prompt = tokenizer.apply_chat_template(
+        token_ids = tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
             enable_thinking=use_thinking,
-            tokenize=False,
-        )
+            return_tensors="pt",
+        )["input_ids"][0].tolist()
     else:
-        # Fallback: concatenate messages
-        prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+        prompt_text = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+        token_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"][0].tolist()
 
     sampling_params = SamplingParams(
         temperature=request.temperature,
@@ -160,14 +175,14 @@ async def chat_completions(request: ChatCompletionRequest):
 
     if request.stream:
         return StreamingResponse(
-            _stream_response(request_id, created, request.model, prompt, sampling_params),
+            _stream_response(request_id, created, request.model, token_ids, sampling_params),
             media_type="text/event-stream",
         )
 
     # Non-streaming: collect all tokens
     full_text = ""
     finish_reason = "stop"
-    async for output in _engine.generate(prompt, sampling_params, request_id):
+    async for output in _engine.generate(token_ids, sampling_params, request_id):
         full_text += output.text_delta
         if output.finish_reason:
             finish_reason = output.finish_reason
@@ -187,7 +202,7 @@ async def chat_completions(request: ChatCompletionRequest):
     )
 
 
-async def _stream_response(request_id, created, model_name, prompt, sampling_params):
+async def _stream_response(request_id, created, model_name, token_ids, sampling_params):
     # Opening chunk with role
     chunk = ChatCompletionChunk(
         id=request_id,
@@ -197,7 +212,7 @@ async def _stream_response(request_id, created, model_name, prompt, sampling_par
     )
     yield f"data: {chunk.model_dump_json()}\n\n"
 
-    async for output in _engine.generate(prompt, sampling_params, request_id):
+    async for output in _engine.generate(token_ids, sampling_params, request_id):
         if output.error:
             break
         chunk = ChatCompletionChunk(

@@ -29,6 +29,7 @@ A lightweight inference and quantization engine for studying LLMs.
 
 ## Features
 
+- **HTTP Serving** -- OpenAI-compatible `/v1/chat/completions` with streaming and concurrent request batching
 - **Continuous Batching** -- dynamic scheduler with FIFO / SPF / LJF / random admission and chunked prefill
 - **Paged KV Cache** -- FA2 paged attention (`block_table`-based), eliminates full-sequence KV gather at decode
 - **Multi-batch CUDA Graph** -- bucketed graph capture across batch sizes [1,2,4,8,...]; decode replay with static paged buffers
@@ -100,6 +101,10 @@ python main.py --config configs/qwen3_5.yaml
 python batch_main.py
 python batch_main.py --sweep-policies fifo spf ljf random
 python batch_main.py --repeat 5
+
+# HTTP server (OpenAI-compatible)
+python scripts/serve/start_server.py --config configs/runs/batch.yaml
+python scripts/serve/bench_serving.py --mode sweep   # concurrent load test
 ```
 
 ### 4. Benchmark

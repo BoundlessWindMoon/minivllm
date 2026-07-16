@@ -255,8 +255,15 @@ class BatchedModelRunner:
                 )
 
     @torch.inference_mode()
-    def step(self) -> list[Request]:
-        """Run one inference step; return requests that finished this step."""
+    def step(self) -> tuple[list[Request], dict[str, int]]:
+        """Run one inference step.
+
+        Returns:
+            finished:   requests that completed this step.
+            new_tokens: mapping request_id -> newly sampled token_id for every
+                        request that produced a token this step (prefill-completed
+                        and decoding requests alike).
+        """
         prefill_chunks, decode_reqs = self.scheduler.schedule()
         self.last_step_stats = {
             "n_decode":       len(decode_reqs),
@@ -264,6 +271,7 @@ class BatchedModelRunner:
             "prefill_tokens": sum(c for _, c in prefill_chunks),
         }
         finished: list[Request] = []
+        new_tokens: dict[str, int] = {}
 
         if decode_reqs:
             # Lazy-capture on the first decode step so the KV pool and model
@@ -279,6 +287,7 @@ class BatchedModelRunner:
             decode_logits = self._run_decode(decode_reqs)
             self._sample_and_update(decode_reqs, decode_logits)
             for req in decode_reqs:
+                new_tokens[req.request_id] = req.generated_ids[-1]
                 if req.is_finished:
                     self.scheduler.on_request_finished(req)
                     finished.append(req)
@@ -288,11 +297,12 @@ class BatchedModelRunner:
             if completed:
                 self._sample_and_update(completed, first_tok_logits)
                 for req in completed:
+                    new_tokens[req.request_id] = req.generated_ids[-1]
                     if req.is_finished:
                         self.scheduler.on_request_finished(req)
                         finished.append(req)
 
-        return finished
+        return finished, new_tokens
 
     def _ensure_pages_for_prefill(self, requests, offsets, chunk_lens):
         """Pre-allocate physical pages for all tokens in this prefill chunk.
