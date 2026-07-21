@@ -8,7 +8,6 @@ license = { text = "MIT" }
 
 dependencies = [
     "torch==2.9.0",
-    "pytest>=8.0",
     "transformers>=5.9.0",
     "accelerate",
     "safetensors",
@@ -21,6 +20,9 @@ dependencies = [
     "pydantic",
     "einops",
     "Pillow",
+    "fastapi",
+    "uvicorn",
+    "requests",
 ]
 
 
@@ -41,8 +43,12 @@ profile = [
 monitor = [
     "swanlab",
 ]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
 all = [
-    "mini-vllm[benchmark,quant,profile,monitor]",
+    "mini-vllm[benchmark,quant,profile,monitor,dev]",
 ]
 
 
@@ -52,3 +58,29 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["model*", "engine*", "layers*", "utils*", "kernels*", "eval*"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+markers = [
+    "unit: fast CPU-only tests, no model required",
+    "integration: requires CUDA and a loaded model — run separately from unit tests",
+    "gpu: alias for integration",
+]
+
+[tool.ruff]
+line-length = 100
+exclude = [".venv", "tmp", "log", "swanlog", "mini_vllm.egg-info", "docs/flash-attention/code"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501",   # line too long — handled by formatter
+    "E402",   # module-level import not at top — needed after optional try/except imports
+    "F401",   # unused import — too noisy during development
+    "F841",   # local variable assigned but never used — common in scaffolding
+    "E741",   # ambiguous variable name
+    "E401",   # multiple imports on one line — existing test file style
+    "E731",   # lambda assignment — used for callbacks, intentional
+    "E701",   # multiple statements on one line (colon)
+    "E702",   # multiple statements on one line (semicolon)
+]

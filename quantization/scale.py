@@ -107,7 +107,7 @@ def apply_scale(module, scales_list, input_feat_dict=None):
 
         if (
             isinstance(prev_op, LinearBase)
-            and type(layers) == list
+            and isinstance(layers, list)
             and isinstance(layers[0], LinearBase)
         ):
             scale_fc_fcs(prev_op, layers, scales)

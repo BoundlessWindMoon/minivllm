@@ -10,7 +10,7 @@ from utils.config import GlobalConfig, print_runtime_config, dump_config
 from engine.loader import load_model, build_kv_pool
 from engine.request import Request
 from utils.batch_loader import load_batch_requests
-from ui.batch_display import run_batch_with_display, print_metrics_summary, print_repeat_summary, print_sweep_summary
+from utils.batch_display import run_batch_with_display, print_metrics_summary, print_repeat_summary, print_sweep_summary
 from engine.scheduler import Scheduler
 from engine.batched_runner import BatchedModelRunner
 

@@ -26,8 +26,8 @@ from utils.config import GlobalConfig, print_runtime_config
 from engine.model_runner import ModelRunner
 from engine.loader import load_model
 from engine.runtime_setup import apply_runtime_patches
-from chat.dialog_manager import DialogManager
-from chat.ui import ChatUI
+from utils.dialog_manager import DialogManager
+from utils.chat_ui import ChatUI
 
 
 def setup_distributed(cfg: GlobalConfig) -> None:

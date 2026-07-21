@@ -34,7 +34,7 @@ def main():
         print("Please install: pip install datasets")
         return
 
-    print(f"Downloading ShareGPT dataset (this may take a moment)...")
+    print("Downloading ShareGPT dataset (this may take a moment)...")
     ds = load_dataset(
         "Aeala/ShareGPT_Vicuna_unfiltered",
         split="train",
