@@ -73,6 +73,8 @@ server.py / batch_main.py → BatchedModelRunner → BatchAsyncEngine → HTTP
 The single-request path exists for backward compatibility and special use cases.
 
 
+## Config system
+
 Configs use `_base` inheritance. A run config points to a model config which
 points to `base.yaml`:
 
@@ -84,6 +86,10 @@ configs/runs/batch.yaml
 
 Override any field inline; later values win. Always use `GlobalConfig.from_yaml(path)`
 to load — do not parse YAML manually.
+
+**All config fields and their defaults are documented in `configs/base.yaml`.**
+That file is the single source of truth for config schema — do not duplicate
+field names or defaults in other docs.
 
 ## Testing rules
 
@@ -98,16 +104,10 @@ to load — do not parse YAML manually.
   root, but individual test files also do it for robustness).
 
 **Integration tests** (`test/integration/`):
-- Require CUDA. They call `torch.set_default_device(cfg.env.device)` — this
-  pollutes global state, so run integration tests in isolation from unit tests
-  or they will cause unit tests that follow to fail with device mismatch errors.
+- Require CUDA. Each test file sets `torch.set_default_device` in its fixture
+  and restores it on teardown — safe to run in any order.
 - Run unit and integration suites separately: `pytest test/unit/` then
   `pytest test/integration/`.
-
-**Known test isolation bug**: `test/integration/test_batch.py` and
-`test/integration/test_single_request.py` call `torch.set_default_device("cuda:0")`.
-If these run before unit tests in the same process, CPU-tensor operations in
-unit tests will fail. Always run `pytest test/unit/` as a separate invocation.
 
 ## Key invariants and sharp edges
 
@@ -154,8 +154,8 @@ unit tests will fail. Always run `pytest test/unit/` as a separate invocation.
 ## Adding a new feature checklist
 
 1. Write unit tests first (`test/unit/`) — they must pass with no GPU.
-2. If the feature touches the engine step loop, update `step()` return type
-   if needed (currently `tuple[list[Request], dict[str, int]]`).
+2. If the feature touches the engine step loop, verify the current `step()`
+   return type in `engine/batched_runner.py` before updating callers.
 3. If the feature adds a new config field, add it to `base.yaml` and document
    the default.
 4. Run `python -m pytest test/unit/ -q` before committing.
@@ -164,9 +164,17 @@ unit tests will fail. Always run `pytest test/unit/` as a separate invocation.
 
 ## Documentation sync rules
 
+**Before writing or updating any doc: verify against the code first.**
+Do not rely on memory or prior context. Check the actual source file for
+flag names, defaults, return types, and behavior. If what you find contradicts
+the existing doc, the code wins — fix the doc.
+
 Docs live in `docs/`. Two kinds:
 
 - **features/** — what it does, how to enable, limits. Update when behavior changes.
+  Write only what users observe (CLI commands, API schema, config keys).
+  Do not name internal classes (`BatchAsyncEngine`, `PagedKVPool`, etc.) or
+  implementation details — those belong in `design/` or code comments.
 - **design/** — why this design. Update only when the architecture changes, not on every refactor.
 
 **When to update docs:**
