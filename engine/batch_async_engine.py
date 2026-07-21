@@ -51,23 +51,44 @@ class BatchAsyncEngine:
 
     async def generate(
         self,
-        prompt_token_ids: list[int],
+        prompt: str | list[int],
         sampling_params: SamplingParams,
         request_id: str | None = None,
     ) -> AsyncIterator[GenerationOutput]:
+        """Generate tokens for a prompt.
+
+        Args:
+            prompt: Either a raw string (tokenized internally) or a list of
+                token ids (used as-is). Callers that have already tokenized
+                (e.g. server.py after applying a chat template) should pass
+                token ids to avoid double-tokenization.
+            sampling_params: Sampling configuration.
+            request_id: Optional request identifier; auto-generated if None.
+        """
         if request_id is None:
             request_id = str(uuid.uuid4())
 
-        # Capture the running loop before enqueuing the request so the step
-        # loop can push tokens the moment it processes this request.
         if self._loop is None:
             self._loop = asyncio.get_running_loop()
 
-        output_queue: asyncio.Queue[GenerationOutput] = asyncio.Queue()
+        if isinstance(prompt, str):
+            has_tmpl = getattr(self._tokenizer, "chat_template", None) is not None
+            if has_tmpl:
+                token_ids = self._tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    add_generation_prompt=True,
+                    enable_thinking=sampling_params.enable_thinking,
+                    return_tensors="pt",
+                )["input_ids"][0].tolist()
+            else:
+                token_ids = self._tokenizer(prompt, return_tensors="pt")["input_ids"][0].tolist()
+        else:
+            token_ids = prompt
 
+        output_queue: asyncio.Queue[GenerationOutput] = asyncio.Queue()
         req = Request(
             request_id=request_id,
-            prompt_token_ids=prompt_token_ids,
+            prompt_token_ids=token_ids,
             sampling_params=sampling_params,
         )
 
@@ -75,7 +96,6 @@ class BatchAsyncEngine:
             self._queues[request_id] = output_queue
             self._scheduler.add_request(req)
 
-        # Yield tokens as they arrive from the step loop.
         while True:
             output = await output_queue.get()
             yield output

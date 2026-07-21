@@ -19,6 +19,7 @@ from engine.loader import load_model, build_kv_pool
 from engine.scheduler import Scheduler
 from engine.batched_runner import BatchedModelRunner
 from engine.batch_async_engine import BatchAsyncEngine
+from engine.prefix_cache import PrefixCache
 from engine.schema import SamplingParams
 
 
@@ -104,11 +105,13 @@ async def lifespan(app: FastAPI):
     pool = build_kv_pool(model, _cfg)
     model.attach_kv_pool(pool)
 
+    prefix_cache = PrefixCache(max_pages=pool.total_pages)
     scheduler = Scheduler(
         pool,
         max_batch_size=_cfg.batch.max_batch_size,
         admission_policy=_cfg.batch.admission_policy,
         max_num_batched_tokens=_cfg.batch.max_num_batched_tokens,
+        prefix_cache=prefix_cache,
     )
     runner = BatchedModelRunner(model, tokenizer, pool, scheduler, _cfg)
 

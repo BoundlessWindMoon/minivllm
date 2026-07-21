@@ -177,18 +177,26 @@ def test_requests_finish_at_different_times():
 # ---------------------------------------------------------------------------
 
 def test_queue_cleaned_up_after_finish():
+    """After a request completes, re-using the same request_id must work correctly."""
     async def _run():
         steps = [({"r1": 1}, ["r1"])]
-        engine, _ = _make_engine(steps, req_ids=["r1"])
-        async for _ in engine.generate([1], SamplingParams(max_new_tokens=1), "r1"):
-            pass
-        await asyncio.sleep(0.05)
-        with engine._lock:
-            leaked = "r1" in engine._queues
+        engine, seq = _make_engine(steps, req_ids=["r1"])
+        # First generation: consume all tokens.
+        first = []
+        async for out in engine.generate([1], SamplingParams(max_new_tokens=1), "r1"):
+            first.append(out.token_id)
+        # Add a second round with the same id and a fresh step sequence.
+        seq._steps.append(({"r1": 2}, ["r1"]))
+        seq._reqs["r1"] = _make_req("r1")
+        second = []
+        async for out in engine.generate([1], SamplingParams(max_new_tokens=1), "r1"):
+            second.append(out.token_id)
         engine.shutdown()
-        return leaked
+        return first, second
 
-    assert not asyncio.run(_run())
+    first, second = asyncio.run(_run())
+    assert first == [1]
+    assert second == [2]
 
 
 # ---------------------------------------------------------------------------
@@ -196,10 +204,11 @@ def test_queue_cleaned_up_after_finish():
 # ---------------------------------------------------------------------------
 
 def test_shutdown_stops_thread():
+    """After shutdown the background worker must stop; _running flag must be False."""
     engine, _ = _make_engine([])
-    assert engine._thread.is_alive()
+    assert engine._running is True
     engine.shutdown()
-    assert not engine._thread.is_alive()
+    assert engine._running is False
 
 
 # ---------------------------------------------------------------------------
@@ -223,3 +232,46 @@ def test_generation_output_fields_are_correct():
     assert o.is_finished is True
     assert o.finish_reason == "eos"
     assert o.error is None
+
+
+# ---------------------------------------------------------------------------
+# str prompt input (tokenized internally)
+# ---------------------------------------------------------------------------
+
+def test_str_prompt_is_tokenized():
+    """Passing a str prompt tokenizes via the engine's tokenizer (no chat_template path)."""
+    calls = []
+
+    class RecordingTokenizer:
+        chat_template = None  # force plain tokenization path
+
+        def __call__(self, text, return_tensors=None):
+            calls.append(text)
+            # return minimal structure engine needs
+            class Ids:
+                def __getitem__(self, k):
+                    return self
+                def tolist(self):
+                    return [1, 2]
+            return {"input_ids": Ids()}
+
+        def decode(self, token_ids, skip_special_tokens=True):
+            return str(token_ids[0])
+
+    async def _run():
+        steps = [({"r1": 5}, ["r1"])]
+        seq = StepSequence(steps, {"r1": _make_req("r1")})
+        runner = MagicMock()
+        runner.step.side_effect = seq.step
+        engine = BatchAsyncEngine(runner, seq, RecordingTokenizer())
+        outputs = []
+        async for out in engine.generate("hello world", SamplingParams(max_new_tokens=1), "r1"):
+            outputs.append(out)
+        engine.shutdown()
+        return calls, outputs
+
+    calls, outputs = asyncio.run(_run())
+    assert calls == ["hello world"]
+    assert len(outputs) == 1
+
+

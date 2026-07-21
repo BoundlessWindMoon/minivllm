@@ -50,9 +50,15 @@ def dist_init():
 @pytest.fixture(scope="module")
 def model_and_tokenizer(dist_init):
     cfg = _base_cfg()
+    prev_dtype  = torch.get_default_dtype()
+    prev_device = torch.get_default_device()
+    torch.set_default_dtype(cfg.env.get_torch_dtype())
+    torch.set_default_device(cfg.env.device)
     model, tokenizer = load_model(cfg)
     model.eval()
-    return model, tokenizer
+    yield model, tokenizer
+    torch.set_default_dtype(prev_dtype)
+    torch.set_default_device(prev_device)
 
 
 # ---------------------------------------------------------------------------

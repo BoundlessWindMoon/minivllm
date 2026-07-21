@@ -77,6 +77,8 @@ class PagedKVPool:
         self._req_to_slot: dict[str, int] = {}
         self._slot_to_req: dict[int, str] = {}
         self._free_slots: set[int] = set(range(num_seqs))
+        # Pages borrowed from PrefixCache; excluded from _free_pages on free().
+        self._shared_pages: dict[str, set[int]] = {}   # req_id → set of shared phys pages
 
         # GPU block table for flash_attn: (num_seqs, pages_per_seq) int32.
         self._block_table_gpu = torch.full(
@@ -88,21 +90,39 @@ class PagedKVPool:
     # Allocation (called by Scheduler)
     # ------------------------------------------------------------------
 
-    def allocate(self, request_id: str) -> int:
+    def allocate(self, request_id: str, prefix_pages: list[int] | None = None) -> int:
+        """Allocate a slot for request_id.
+
+        prefix_pages: physical pages already populated by prefix caching.
+            These are pre-filled into the block_table without consuming
+            _free_pages, and are NOT returned to _free_pages on free().
+        """
         if not self._free_slots:
             raise RuntimeError("PagedKVPool: no free slots")
         slot_id = min(self._free_slots)
         self._free_slots.discard(slot_id)
         self._req_to_slot[request_id] = slot_id
         self._slot_to_req[slot_id] = request_id
-        self._block_tables[request_id] = []
         self._block_table_gpu[slot_id].fill_(self.dummy_page_id)
+
+        if prefix_pages:
+            self._block_tables[request_id] = list(prefix_pages)
+            self._shared_pages[request_id] = set(prefix_pages)
+            for logical, phys in enumerate(prefix_pages):
+                self._block_table_gpu[slot_id, logical] = phys
+        else:
+            self._block_tables[request_id] = []
+            self._shared_pages[request_id] = set()
         return slot_id
 
     def free(self, slot_id: int) -> None:
         req_id = self._slot_to_req.pop(slot_id, None)
         if req_id is not None:
-            self._free_pages.extend(self._block_tables.pop(req_id, []))
+            shared = self._shared_pages.pop(req_id, set())
+            # Only return exclusively-owned pages to the free pool.
+            owned = [p for p in self._block_tables.pop(req_id, [])
+                     if p not in shared]
+            self._free_pages.extend(owned)
             del self._req_to_slot[req_id]
         self._free_slots.add(slot_id)
         self._block_table_gpu[slot_id].fill_(self.dummy_page_id)
@@ -137,6 +157,10 @@ class PagedKVPool:
     def block_table_for(self, slot_ids: torch.Tensor) -> torch.Tensor:
         """Return (bs, pages_per_seq) int32 block table for the given slots."""
         return self._block_table_gpu[slot_ids]
+
+    def pages_for(self, request_id: str) -> list[int]:
+        """Return the physical pages allocated for request_id."""
+        return list(self._block_tables.get(request_id, []))
 
     def get_layer_view(self, layer_idx: int) -> "PagedKVLayer":
         return PagedKVLayer(pool=self, layer_idx=layer_idx)

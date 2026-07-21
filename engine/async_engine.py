@@ -1,4 +1,7 @@
-"""AsyncLLMEngine: bridges blocking GPU inference with async FastAPI handlers.
+"""AsyncLLMEngine: single-request async bridge for main.py and chat_cli.py.
+
+This module belongs to the single-request inference path (main.py → ModelRunner).
+For the batch serving path used by server.py, see engine/batch_async_engine.py.
 
 Design:
 - A single dedicated inference thread owns the GPU; requests are serialised
@@ -6,9 +9,6 @@ Design:
 - Each request gets its own asyncio.Queue for token-by-token streaming.
 - The thread puts results back into the event loop via loop.call_soon_threadsafe,
   which is the standard safe cross-thread asyncio bridge.
-- step() is the natural batch boundary: today it processes one request; later it
-  can accept a list[GenerationRequest] for continuous batching without touching
-  the API layer or this class's public interface.
 """
 
 import asyncio
