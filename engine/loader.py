@@ -23,12 +23,12 @@ from model.factory import create_base_model, create_megakernel_model
 
 
 def build_kv_pool(model, cfg: GlobalConfig):
-    """Build a KVCachePool sized for *model* using batch settings from *cfg*."""
-    from engine.kv_pool import KVCachePool
+    """Build a PagedKVPool sized for *model* using batch settings from *cfg*."""
+    from engine.kv_pool import PagedKVPool
     mc       = model.config
     head_dim = getattr(mc, "head_dim", mc.hidden_size // mc.num_attention_heads)
-    return KVCachePool(
-        num_slots    = cfg.batch.num_slots,
+    return PagedKVPool(
+        num_seqs     = cfg.batch.num_slots,
         num_layers   = mc.num_hidden_layers,
         num_kv_heads = mc.num_key_value_heads,
         max_seq_len  = cfg.model.kv_cache.max_len,

@@ -1,2 +1,0 @@
-# Redirect to new location. Use configs/runs/default.yaml directly.
-_base: runs/default.yaml

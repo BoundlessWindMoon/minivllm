@@ -26,7 +26,7 @@ except ImportError:
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import requests
-from chat.ui import ChatUI
+from utils.chat_ui import ChatUI
 
 DEFAULT_URL = "http://localhost:8000"
 

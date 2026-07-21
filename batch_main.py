@@ -10,7 +10,7 @@ from utils.config import GlobalConfig, print_runtime_config, dump_config
 from engine.loader import load_model, build_kv_pool
 from engine.request import Request
 from utils.batch_loader import load_batch_requests
-from ui.batch_display import run_batch_with_display, print_metrics_summary, print_repeat_summary, print_sweep_summary
+from utils.batch_display import run_batch_with_display, print_metrics_summary, print_repeat_summary, print_sweep_summary
 from engine.scheduler import Scheduler
 from engine.batched_runner import BatchedModelRunner
 
@@ -73,9 +73,8 @@ def main():
         print(dump_config(cfg))
         return
 
-    cfg.model.backend           = "default"
-    cfg.model.use_cuda_graph    = False
-    cfg.model.kv_cache.backend  = "default"
+    cfg.model.backend          = "default"
+    cfg.model.kv_cache.backend = "default"
 
     torch.set_default_dtype(cfg.env.get_torch_dtype())
     torch.set_default_device(cfg.env.device)

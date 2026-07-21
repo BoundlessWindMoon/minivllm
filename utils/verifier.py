@@ -97,7 +97,7 @@ class Verifier:
             self.baseline_meta = cached_meta
             return self.baseline_cache
 
-        logger.info(f"[Verifier] 计算 HuggingFace baseline PPL...")
+        logger.info("[Verifier] 计算 HuggingFace baseline PPL...")
         hf_model = AutoModelForCausalLM.from_pretrained(
             self.baseline_model_path,
             torch_dtype=self.baseline_model_dtype,
@@ -159,7 +159,7 @@ class Verifier:
             self.greedy_cache = cached_data
             return self.greedy_cache
 
-        logger.warning(f"[Verifier] 生成 HuggingFace greedy decode cache...")
+        logger.warning("[Verifier] 生成 HuggingFace greedy decode cache...")
         hf_model = AutoModelForCausalLM.from_pretrained(
             self.baseline_model_path,
             torch_dtype=self.baseline_model_dtype,
@@ -256,7 +256,7 @@ class Verifier:
         if "ppl" in verification_results:
             ppl_res = verification_results["ppl"]
             status = "✓ PASS" if ppl_res["is_close"] else "✗ FAIL"
-            (f"[Prefill 验证] PPL 差异:")
+            ("[Prefill 验证] PPL 差异:")
             logger.success(
                 f"\n状态: {status}"
                 f"  HuggingFace baseline PPL: {ppl_res['baseline_ppl']:.4f}"
@@ -267,7 +267,7 @@ class Verifier:
         if "decode_diverge" in verification_results:
             div_res = verification_results["decode_diverge"]
             if div_res["is_match"]:
-                logger.success(f"\n[Decode 验证] greedy decode 完全一致: ✓ PASS")
+                logger.success("\n[Decode 验证] greedy decode 完全一致: ✓ PASS")
             else:
                 logger.error(
                     f"\n[Decode 验证] 检测到发散: ✗ FAIL"

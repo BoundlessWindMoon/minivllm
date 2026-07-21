@@ -14,13 +14,15 @@ from engine.schema import SamplingParams
 
 class FakePool:
     """Minimal pool stub: tracks slot alloc/free, never runs out unless told to."""
+    page_size = 16   # arbitrary; prefix cache lookups need this attribute
+
     def __init__(self, num_slots=32):
         self._free = set(range(num_slots))
         self._used = {}
 
     def num_free_slots(self): return len(self._free)
 
-    def allocate(self, request_id):
+    def allocate(self, request_id, prefix_pages=None):
         slot = self._free.pop()
         self._used[slot] = request_id
         return slot
@@ -237,3 +239,143 @@ def test_chunked_prefill_converges():
         if total >= r.num_prompt_tokens:
             break
     assert total == r.num_prompt_tokens
+
+
+# ---------------------------------------------------------------------------
+# Prefix cache integration
+# ---------------------------------------------------------------------------
+
+class FakePoolWithPages(FakePool):
+    """Extends FakePool to support prefix cache: tracks block_tables with pre-allocated pages."""
+    def __init__(self, num_slots=32, page_size=4):
+        super().__init__(num_slots)
+        self.page_size = page_size
+        self._block_tables: dict[str, list[int]] = {}
+        self._shared_pages: dict[str, set[int]] = {}
+        self._next_page = 0
+
+    def allocate(self, request_id, prefix_pages=None):
+        slot = super().allocate(request_id)
+        if prefix_pages:
+            self._block_tables[request_id] = list(prefix_pages)
+            self._shared_pages[request_id] = set(prefix_pages)
+        else:
+            self._block_tables[request_id] = []
+            self._shared_pages[request_id] = set()
+        return slot
+
+    def free(self, slot_id):
+        # Find req_id from slot_id before calling super (which pops it).
+        req_id = self._slot_to_req.get(slot_id)
+        if req_id:
+            shared = self._shared_pages.pop(req_id, set())
+            self._block_tables.pop(req_id, None)
+            _ = shared
+        super().free(slot_id)
+
+    # Expose slot lookup so free() above works.
+    @property
+    def _slot_to_req(self):
+        return {v: k for k, v in self._used.items()}
+
+    def pages_for(self, request_id):
+        return list(self._block_tables.get(request_id, []))
+
+    def ensure_pages(self, request_id, token_pos):
+        """Pre-allocate a page for token_pos if not already done."""
+        logical = token_pos // self.page_size
+        pages = self._block_tables.setdefault(request_id, [])
+        while logical >= len(pages):
+            pages.append(self._next_page)
+            self._next_page += 1
+
+
+def make_sched_with_prefix(page_size=4):
+    from engine.prefix_cache import PrefixCache
+    pool = FakePoolWithPages(num_slots=8, page_size=page_size)
+    pc = PrefixCache(max_pages=64)
+    s = Scheduler(pool, max_batch_size=4, prefix_cache=pc)
+    return s, pool, pc
+
+
+def run_prefill_to_completion(scheduler, req):
+    """Drive a request through prefill using the scheduler, simulating the runner.
+
+    Also calls ensure_pages for each token so block_tables are populated,
+    matching what BatchedModelRunner does before every forward pass.
+    """
+    from engine.request import RequestStatus
+    pool = scheduler._pool
+    while req.status != RequestStatus.DECODING:
+        chunks, _ = scheduler.schedule()
+        for r, ct in chunks:
+            # Simulate runner calling ensure_pages for each token in the chunk.
+            if hasattr(pool, 'ensure_pages'):
+                page_size = pool.page_size
+                start = r.prefilled_len
+                for tok_idx in range(ct):
+                    pool.ensure_pages(r.request_id, start + tok_idx)
+            r.prefilled_len += ct
+            r.cache_len = r.prefilled_len
+            if r.prefilled_len >= r.num_prompt_tokens:
+                r.status = RequestStatus.DECODING
+
+
+def test_prefix_cache_miss_on_first_request():
+    s, pool, pc = make_sched_with_prefix(page_size=4)
+    req = make_req(8, "r1")   # 2 full pages
+    s.add_request(req)
+    run_prefill_to_completion(s, req)
+    assert req.cached_prefix_len == 0   # cold miss
+
+
+def test_prefix_cache_inserts_on_finish():
+    s, pool, pc = make_sched_with_prefix(page_size=4)
+    req = make_req(8, "r1")
+    s.add_request(req)
+    run_prefill_to_completion(s, req)
+    req.mark_finished("length")
+    s.on_request_finished(req)
+    assert pc.num_cached_pages == 2   # 8 tokens / page_size 4 = 2 full pages
+
+
+def test_prefix_cache_hit_on_second_request():
+    s, pool, pc = make_sched_with_prefix(page_size=4)
+    tokens = list(range(8))
+
+    # First request: populate the cache.
+    req1 = Request("r1", tokens, SamplingParams(max_new_tokens=4))
+    s.add_request(req1)
+    run_prefill_to_completion(s, req1)
+    req1.mark_finished("length")
+    s.on_request_finished(req1)
+
+    # Second request: same prefix → should hit.
+    req2 = Request("r2", tokens + [99, 100], SamplingParams(max_new_tokens=4))
+    s.add_request(req2)
+    s.schedule()   # triggers admission and cache lookup
+
+    assert req2.cached_prefix_len == 8    # 2 full pages matched
+    assert req2.prefilled_len == 8        # starts prefill from token 8
+    assert req2.cache_len == 8
+
+
+def test_prefix_cache_partial_match():
+    s, pool, pc = make_sched_with_prefix(page_size=4)
+    tokens = list(range(8))
+
+    req1 = Request("r1", tokens, SamplingParams(max_new_tokens=4))
+    s.add_request(req1)
+    run_prefill_to_completion(s, req1)
+    req1.mark_finished("length")
+    s.on_request_finished(req1)
+
+    # req2 shares only the first 4 tokens (1 page), then diverges.
+    req2 = Request("r2", tokens[:4] + [200, 201, 202, 203],
+                   SamplingParams(max_new_tokens=4))
+    s.add_request(req2)
+    s.schedule()
+
+    assert req2.cached_prefix_len == 4    # only 1 page matched
+    assert req2.prefilled_len == 4
+

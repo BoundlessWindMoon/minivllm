@@ -184,14 +184,17 @@ class BenchmarkResult:
 # Prompt generation
 # ---------------------------------------------------------------------------
 
-def make_synthetic_prompt(target_tokens: int) -> str:
+def make_synthetic_prompt(target_tokens: int, shared_prefix: str = "") -> str:
     """Build a random English-like prompt of approximately *target_tokens* tokens.
 
     Uses ~0.75 words-per-token as a rough approximation.
+    If shared_prefix is provided it is prepended; target_tokens refers to the
+    unique (non-shared) tail only.
     """
     n_words = max(10, int(target_tokens * 0.75))
     body = " ".join(random.choices(_VOCAB, k=n_words))
-    return body + "\n\nPlease respond in detail."
+    tail = body + "\n\nPlease respond in detail."
+    return (shared_prefix + "\n\n" + tail) if shared_prefix else tail
 
 
 def load_sharegpt(path: str, n: int, seed: int = 42) -> list[str]:
@@ -467,11 +470,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-requests", type=int,   default=DEFAULT_NUM_REQUESTS, help="fixed/sweep mode")
     p.add_argument("--request-rate", type=float, default=DEFAULT_RATE,         help="req/s, Poisson mode")
     p.add_argument("--duration",     type=float, default=DEFAULT_DURATION,     help="seconds, Poisson mode")
-    p.add_argument("--input-len",    type=int,   default=DEFAULT_INPUT_LEN,    help="synthetic prompt tokens")
+    p.add_argument("--input-len",    type=int,   default=DEFAULT_INPUT_LEN,    help="synthetic prompt tokens (unique tail per request)")
     p.add_argument("--output-len",   type=int,   default=DEFAULT_OUTPUT_LEN,   help="max_tokens to server")
     p.add_argument("--temperature",  type=float, default=0.0)
     p.add_argument("--warmup",       type=int,   default=WARMUP_REQUESTS,      help="requests to discard")
     p.add_argument("--sweep-levels", type=int,   nargs="+", default=SWEEP_LEVELS)
+    p.add_argument("--shared-prefix-len", type=int, default=0,
+                   help="tokens of shared prefix prepended to every prompt (0 = disabled)")
     p.add_argument("--dataset",      default=None, help="ShareGPT JSON path")
     p.add_argument("--seed",         type=int,   default=42)
     p.add_argument("--output",       default=None, help="save JSON results to this path")
@@ -495,8 +500,18 @@ def main() -> None:
         print(f"Loaded {len(prompts)} prompts from {args.dataset}")
     else:
         need = max(args.num_requests + WARMUP_REQUESTS, 64)
-        prompts = [make_synthetic_prompt(args.input_len) for _ in range(need)]
-        print(f"Generated {len(prompts)} synthetic prompts (~{args.input_len} tokens each)")
+        shared_prefix = ""
+        if args.shared_prefix_len > 0:
+            n_words = max(10, int(args.shared_prefix_len * 0.75))
+            shared_prefix = " ".join(random.choices(_VOCAB, k=n_words))
+            if args.shared_prefix_len < 256:
+                print(f"[warn] --shared-prefix-len {args.shared_prefix_len} may produce fewer than "
+                      f"256 tokens after tokenization; prefix cache requires at least one full "
+                      f"page (page_size=256) to activate. Consider using --shared-prefix-len 512+")
+            print(f"Shared prefix: ~{args.shared_prefix_len} tokens (fixed across all requests)")
+        prompts = [make_synthetic_prompt(args.input_len, shared_prefix) for _ in range(need)]
+        label = f"~{args.shared_prefix_len}+{args.input_len}" if shared_prefix else f"~{args.input_len}"
+        print(f"Generated {len(prompts)} synthetic prompts ({label} tokens each)")
 
     # Run
     all_results: list[BenchmarkResult] = []

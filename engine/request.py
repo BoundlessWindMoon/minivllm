@@ -38,6 +38,7 @@ class Request:
 
     # ---- Assigned by Scheduler -----------------------------------
     slot_id: int = -1
+    cached_prefix_len: int = 0      # tokens already in KV cache from prefix caching
 
     # ---- Mutated by BatchedModelRunner ---------------------------
     cache_len: int = 0

@@ -137,18 +137,48 @@ def run_batch_with_display(
                           runner.last_step_stats, cfg, tokenizer)
 
     with Live(_panel(), refresh_per_second=10, transient=False) as live:
-        # Register callback: fires just before each prefill forward pass.
-        # At that point requests are already PREFILLING, so _panel() shows
-        # the correct state. PyTorch releases the GIL during CUDA ops, so
-        # Rich's background render thread keeps refreshing the display for
-        # the full duration of the prefill computation.
         runner.on_prefill_start = lambda _: live.update(_panel())
+
+        _cg_sizes: list[int] = []
+        _cg_captured: list[int] = []
+
+        def _on_capture_start(capture_sizes: list):
+            _cg_sizes.clear()
+            _cg_sizes.extend(capture_sizes)
+            live.console.print(
+                f"[bold yellow]⚡ CUDA Graph[/bold yellow]  "
+                f"[dim]capturing {len(capture_sizes)} graphs "
+                f"(bs={capture_sizes}) …[/dim]"
+            )
+
+        def _on_capture_step(bs: int):
+            _cg_captured.append(bs)
+            done = len(_cg_captured)
+            total = len(_cg_sizes)
+            bar_filled = int(24 * done / total)
+            bar = "━" * bar_filled + "╸" * (1 if bar_filled < 24 else 0) + " " * (24 - bar_filled - (1 if bar_filled < 24 else 0))
+            pct = int(100 * done / total)
+            live.console.print(
+                f"[bold yellow]⚡ CUDA Graph[/bold yellow]  "
+                f"[yellow]{bar}[/yellow] "
+                f"{pct:3d}%  [dim]{done}/{total}  bs={bs} captured[/dim]",
+                end="\r",
+            )
+            if done == total:
+                live.console.print(
+                    f"[bold yellow]⚡ CUDA Graph[/bold yellow]  "
+                    f"[green]{'━' * 24}[/green] "
+                    f"100%  [dim]{total}/{total} graphs ready[/dim]"
+                )
+
+        runner.on_graph_capture_start = _on_capture_start
+        runner.on_graph_capture_step  = _on_capture_step
 
         while scheduler.has_work():
             if timeout_seconds and (time.perf_counter() - t0) > timeout_seconds:
                 print(f"\n[yellow]Timeout ({timeout_seconds:.0f}s): stopping early.[/yellow]")
                 break
-            finished    = runner.step()
+            finished, _ = runner.step()
             total_toks += sum(r.num_generated_tokens for r in finished)
             step       += 1
 
@@ -157,11 +187,10 @@ def run_batch_with_display(
                 prompt = " ".join((req.prompt_text or "").split())
 
                 w = live.console.width
-                # Fixed columns used by id / reason / tok / prompt / separator
                 prompt_trunc  = _trunc(prompt, 30)
                 prefix_cols   = (_vis(req.request_id) + 1 + _vis(req.finish_reason) + 1
-                                 + len(str(req.num_generated_tokens)) + 4   # "tok  "
-                                 + _vis(prompt_trunc) + 5)                  # "  →  "
+                                 + len(str(req.num_generated_tokens)) + 4
+                                 + _vis(prompt_trunc) + 5)
                 out_budget    = max(10, w - prefix_cols)
                 out_trunc     = _trunc(out, out_budget)
 

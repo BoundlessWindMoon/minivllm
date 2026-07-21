@@ -1,6 +1,7 @@
 """BatchedModelRunner: drives inference for a heterogeneous batch of requests."""
 
 from __future__ import annotations
+import bisect
 import copy
 import time
 import uuid
@@ -18,6 +19,190 @@ from utils.logger import logger
 if TYPE_CHECKING:
     from engine.kv_pool import KVCachePool
     from engine.scheduler import Scheduler
+
+
+def _build_capture_sizes(max_bs: int) -> list[int]:
+    """Build the bucket list for decode CUDA graph capture.
+
+    Mirrors vllm's default: [1, 2, 4] + multiples-of-8 up to max_bs.
+    Ensures max_bs itself is always included.
+    """
+    sizes = [1, 2, 4]
+    sizes += list(range(8, max_bs, 8))
+    if not sizes or sizes[-1] != max_bs:
+        sizes.append(max_bs)
+    return sorted(set(s for s in sizes if s <= max_bs))
+
+
+class BatchDecodeGraphManager:
+    """Owns static decode buffers and the per-bucket CUDA graphs.
+
+    Design (vllm FULL-mode style):
+    - Static buffers allocated to max_bs; capture slices [:bs] for each bucket.
+    - At runtime, real_bs is rounded up to the nearest bucket with bisect.
+    - Padding rows get a dummy slot_id (0) and cache_len (0); their KV writes
+      are suppressed via ctx.num_real_reqs in kv_pool / attention layers.
+    - Graph key = padded_bs (int).
+    """
+
+    def __init__(self, model, max_bs: int, device: str, dummy_slot_id: int = 0,
+                 kv_pool=None) -> None:
+        self.model = model
+        self.max_bs = max_bs
+        self.device = device
+        self.dummy_slot_id = dummy_slot_id
+        self.kv_pool = kv_pool
+        self.capture_sizes = _build_capture_sizes(max_bs)
+
+        # Static input buffers sized to max_bs.
+        self._input_ids    = torch.zeros(max_bs, 1, dtype=torch.long,  device=device)
+        self._position_ids = torch.zeros(max_bs, 1, dtype=torch.long,  device=device)
+        self._slot_ids     = torch.full((max_bs,), dummy_slot_id, dtype=torch.long, device=device)
+        self._cache_lens   = torch.zeros(max_bs,    dtype=torch.long,  device=device)
+
+        # Static buffers for paged KV (populated when kv_pool is a PagedKVPool).
+        pages_per_seq = getattr(kv_pool, 'pages_per_seq', 0) if kv_pool else 0
+        self._pages_per_seq = pages_per_seq
+        if pages_per_seq > 0:
+            dummy_pid = getattr(kv_pool, 'dummy_page_id', 0)
+            self._block_table = torch.full(
+                (max_bs, pages_per_seq), dummy_pid, dtype=torch.int32, device=device
+            )
+            self._seq_lens_buf = torch.zeros(max_bs, dtype=torch.int32, device=device)
+        else:
+            self._block_table = None
+            self._seq_lens_buf = None
+
+        self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._outputs: dict[int, torch.Tensor] = {}
+        self._pool_handle = torch.cuda.graph_pool_handle()
+
+        logger.info(
+            f"[BatchCUDAGraph] Initialized: max_bs={max_bs}, "
+            f"capture_sizes={self.capture_sizes}, dummy_slot={dummy_slot_id}"
+        )
+
+    def pad_to_bucket(self, real_bs: int) -> int:
+        idx = bisect.bisect_left(self.capture_sizes, real_bs)
+        return self.capture_sizes[idx]
+
+    def _capture_one(self, bs: int) -> None:
+        """Capture the decode graph for a given bs bucket."""
+        set_context(
+            is_prefill=False,
+            cache_len=0,
+            slot_ids=self._slot_ids[:bs],
+            cache_lens=self._cache_lens[:bs],
+            num_real_reqs=bs,
+            block_tables=self._block_table[:bs] if self._block_table is not None else None,
+            seq_lens=self._seq_lens_buf[:bs] if self._seq_lens_buf is not None else None,
+        )
+
+        # Warmup — more iterations for the first capture to let CUDA allocate.
+        warmup_iters = 3 if not self._graphs else 1
+        for _ in range(warmup_iters):
+            self.model(self._input_ids[:bs], self._position_ids[:bs])
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, pool=self._pool_handle):
+            out = self.model(self._input_ids[:bs], self._position_ids[:bs])
+        torch.cuda.synchronize()
+
+        self._graphs[bs] = g
+        self._outputs[bs] = out
+        logger.info(f"[BatchCUDAGraph] Captured bs={bs}")
+
+    def capture_all(self, kv_pool=None, on_captured=None) -> None:
+        """Pre-capture graphs for all bucket sizes (largest first for pool reuse).
+
+        kv_pool: if provided, snapshot its caches before capture and restore
+        afterwards so that warmup/capture forward passes don't corrupt live KV.
+        on_captured: optional fn(bs: int) called after each bucket is captured.
+        """
+        logger.info(
+            f"[BatchCUDAGraph] Capturing {len(self.capture_sizes)} graphs ..."
+        )
+        snapshots = None
+        if kv_pool is not None:
+            snapshots = (
+                [c.cpu() for c in kv_pool.k_caches],
+                [c.cpu() for c in kv_pool.v_caches],
+            )
+
+        try:
+            for bs in reversed(self.capture_sizes):
+                self._capture_one(bs)
+                if on_captured:
+                    on_captured(bs)
+        finally:
+            if snapshots is not None:
+                k_snaps, v_snaps = snapshots
+                for i, (ks, vs) in enumerate(zip(k_snaps, v_snaps)):
+                    kv_pool.k_caches[i].copy_(ks)
+                    kv_pool.v_caches[i].copy_(vs)
+                logger.info("[BatchCUDAGraph] KV pool restored after capture.")
+
+        logger.info(
+            f"[BatchCUDAGraph] Done. Captured {len(self._graphs)} graphs."
+        )
+
+    def run(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        slot_ids: torch.Tensor,
+        cache_lens: torch.Tensor,
+        real_bs: int,
+        requests: list | None = None,
+    ) -> torch.Tensor:
+        """Copy real inputs into static buffers, replay graph, return logits."""
+        padded_bs = self.pad_to_bucket(real_bs)
+
+        # Ensure pages before graph replay — store_kv inside the graph cannot
+        # call Python ensure_pages at replay time.
+        if self.kv_pool is not None and hasattr(self.kv_pool, 'ensure_pages') and requests:
+            for req in requests:
+                self.kv_pool.ensure_pages(req.request_id, req.cache_len)
+
+        # Fill real rows.
+        self._input_ids[:real_bs].copy_(input_ids)
+        self._position_ids[:real_bs].copy_(position_ids)
+        self._slot_ids[:real_bs].copy_(slot_ids)
+        self._cache_lens[:real_bs].copy_(cache_lens)
+
+        # Zero out padding rows; point their slot_ids to the dummy sink slot
+        # so any KV writes land in the dedicated dummy slot instead of slot 0.
+        if padded_bs > real_bs:
+            self._input_ids[real_bs:padded_bs].zero_()
+            self._position_ids[real_bs:padded_bs].zero_()
+            self._slot_ids[real_bs:padded_bs].fill_(self.dummy_slot_id)
+            self._cache_lens[real_bs:padded_bs].zero_()
+
+        # Copy paged KV metadata for real rows.
+        if self._block_table is not None and self.kv_pool is not None:
+            bt = self.kv_pool.block_table_for(slot_ids)  # (real_bs, pages_per_seq)
+            self._block_table[:real_bs].copy_(bt)
+            if padded_bs > real_bs:
+                dummy_pid = getattr(self.kv_pool, 'dummy_page_id', 0)
+                self._block_table[real_bs:padded_bs].fill_(dummy_pid)
+            seq_lens_real = (cache_lens + 1).to(torch.int32)
+            self._seq_lens_buf[:real_bs].copy_(seq_lens_real)
+            if padded_bs > real_bs:
+                self._seq_lens_buf[real_bs:padded_bs].zero_()
+
+        set_context(
+            is_prefill=False,
+            cache_len=0,
+            slot_ids=self._slot_ids[:padded_bs],
+            cache_lens=self._cache_lens[:padded_bs],
+            num_real_reqs=real_bs,
+            block_tables=self._block_table[:padded_bs] if self._block_table is not None else None,
+            seq_lens=self._seq_lens_buf[:padded_bs] if self._seq_lens_buf is not None else None,
+        )
+
+        self._graphs[padded_bs].replay()
+        return self._outputs[padded_bs][:real_bs]
 
 
 class BatchedModelRunner:
@@ -47,10 +232,38 @@ class BatchedModelRunner:
         self._eos_ids = self._collect_eos_ids()
         self.last_step_stats: dict = {"n_decode": 0, "n_prefill": 0, "prefill_tokens": 0}
         self.on_prefill_start: Callable[[list[Request]], None] | None = None
+        # Called once before graph capture starts: fn(capture_sizes: list[int])
+        self.on_graph_capture_start: Callable[[list[int]], None] | None = None
+        # Called after each bucket is captured: fn(bs: int)
+        self.on_graph_capture_step: Callable[[int], None] | None = None
+
+        # CUDA graph setup for batched decode.
+        self._graph_manager: BatchDecodeGraphManager | None = None
+        use_cg = cfg.model.use_cuda_graph and torch.cuda.is_available()
+        if use_cg:
+            max_bs = cfg.model.cuda_graph_max_batch_size or cfg.batch.max_batch_size
+            if not getattr(model, "supports_cuda_graph", True):
+                logger.warning(
+                    f"{type(model).__name__} does not support CUDA Graph, disabling."
+                )
+            else:
+                self._graph_manager = BatchDecodeGraphManager(
+                    model, max_bs, self.device,
+                    dummy_slot_id=getattr(self.kv_pool, 'dummy_page_id',
+                                          getattr(self.kv_pool, 'dummy_slot_id', 0)),
+                    kv_pool=self.kv_pool,
+                )
 
     @torch.inference_mode()
-    def step(self) -> list[Request]:
-        """Run one inference step; return requests that finished this step."""
+    def step(self) -> tuple[list[Request], dict[str, int]]:
+        """Run one inference step.
+
+        Returns:
+            finished:   requests that completed this step.
+            new_tokens: mapping request_id -> newly sampled token_id for every
+                        request that produced a token this step (prefill-completed
+                        and decoding requests alike).
+        """
         prefill_chunks, decode_reqs = self.scheduler.schedule()
         self.last_step_stats = {
             "n_decode":       len(decode_reqs),
@@ -58,11 +271,23 @@ class BatchedModelRunner:
             "prefill_tokens": sum(c for _, c in prefill_chunks),
         }
         finished: list[Request] = []
+        new_tokens: dict[str, int] = {}
 
         if decode_reqs:
+            # Lazy-capture on the first decode step so the KV pool and model
+            # are fully warmed up before we touch the CUDA graph.
+            if self._graph_manager is not None and not self._graph_manager._graphs:
+                if self.on_graph_capture_start:
+                    self.on_graph_capture_start(self._graph_manager.capture_sizes)
+                self._graph_manager.capture_all(
+                    kv_pool=self.kv_pool,
+                    on_captured=self.on_graph_capture_step,
+                )
+
             decode_logits = self._run_decode(decode_reqs)
             self._sample_and_update(decode_reqs, decode_logits)
             for req in decode_reqs:
+                new_tokens[req.request_id] = req.generated_ids[-1]
                 if req.is_finished:
                     self.scheduler.on_request_finished(req)
                     finished.append(req)
@@ -72,11 +297,28 @@ class BatchedModelRunner:
             if completed:
                 self._sample_and_update(completed, first_tok_logits)
                 for req in completed:
+                    new_tokens[req.request_id] = req.generated_ids[-1]
                     if req.is_finished:
                         self.scheduler.on_request_finished(req)
                         finished.append(req)
 
-        return finished
+        return finished, new_tokens
+
+    def _ensure_pages_for_prefill(self, requests, offsets, chunk_lens):
+        """Pre-allocate physical pages for all tokens in this prefill chunk.
+
+        Only allocates at page boundaries — at most ceil(chunk_len / page_size)
+        allocations per request instead of one per token.
+        """
+        if not hasattr(self.kv_pool, 'ensure_pages'):
+            return
+        page_size = getattr(self.kv_pool, 'page_size', 1)
+        for req, start, chunk_len in zip(requests, offsets, chunk_lens):
+            req_id = req.request_id
+            first_page = start // page_size
+            last_page  = (start + chunk_len - 1) // page_size
+            for logical_page in range(first_page, last_page + 1):
+                self.kv_pool.ensure_pages(req_id, logical_page * page_size)
 
     def _run_prefill(
         self, chunks: list[tuple[Request, int]]
@@ -91,7 +333,16 @@ class BatchedModelRunner:
         (input_ids, position_ids, slot_ids,
          cu_seqlens, offsets, actual_lens) = self._build_prefill_inputs(requests, chunk_sizes)
 
+        # Ensure pages exist for every token in this chunk before the forward pass.
+        self._ensure_pages_for_prefill(requests, offsets, actual_lens)
+
         cache_lens_t = torch.tensor(offsets, dtype=torch.long, device=self.device)
+
+        # block_tables for paged KV prefill attention
+        block_tables = (
+            self.kv_pool.block_table_for(slot_ids)
+            if hasattr(self.kv_pool, 'block_table_for') else None
+        )
         set_context(
             is_prefill=True,
             cache_len=int(max(offsets)) if offsets else 0,
@@ -102,6 +353,7 @@ class BatchedModelRunner:
             max_seqlen_q=max(actual_lens),
             max_seqlen_k=max(o + l for o, l in zip(offsets, actual_lens)),
             attn_mask=None,
+            block_tables=block_tables,
         )
         logits_all = self.model(input_ids, position_ids)
 
@@ -127,13 +379,35 @@ class BatchedModelRunner:
     def _run_decode(self, requests: list[Request]) -> torch.Tensor:
         """Decode one token per request; return logits of shape (batch, vocab)."""
         input_ids, position_ids, slot_ids, cache_lens_t = self._build_decode_inputs(requests)
-        set_context(
-            is_prefill=False,
-            cache_len=int(cache_lens_t[0].item()),
-            slot_ids=slot_ids,
-            cache_lens=cache_lens_t,
+
+        # Ensure a page exists for the new token position (cache_len) for each req.
+        if hasattr(self.kv_pool, 'ensure_pages'):
+            for req in requests:
+                self.kv_pool.ensure_pages(req.request_id, req.cache_len)
+
+        block_tables = (
+            self.kv_pool.block_table_for(slot_ids)
+            if hasattr(self.kv_pool, 'block_table_for') else None
         )
-        logits_all = self.model(input_ids, position_ids)
+        # seq_lens = cache_len + 1 (the new token written this step is included)
+        seq_lens = (cache_lens_t + 1).to(torch.int32) if block_tables is not None else None
+
+        if self._graph_manager is not None:
+            real_bs = len(requests)
+            logits_all = self._graph_manager.run(
+                input_ids, position_ids, slot_ids, cache_lens_t, real_bs,
+                requests=requests,
+            )
+        else:
+            set_context(
+                is_prefill=False,
+                cache_len=int(cache_lens_t[0].item()),
+                slot_ids=slot_ids,
+                cache_lens=cache_lens_t,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+            )
+            logits_all = self.model(input_ids, position_ids)
 
         for req in requests:
             req.cache_len += 1

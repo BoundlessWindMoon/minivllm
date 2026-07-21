@@ -145,16 +145,20 @@ def test_no_cache_forward_shape():
 # ---------------------------------------------------------------------------
 
 def test_batch_prefill_sdpa_fallback_with_kv_backend():
-    """Batch prefill with a KVCacheLayer backend falls back to SDPA when FA is off."""
-    from engine.kv_pool import KVCachePool
+    """Batch prefill with a PagedKVLayer backend falls back to SDPA when FA is off."""
+    from engine.kv_pool import PagedKVPool
+    from engine.context import set_context
     batch, seq = 2, 4
-    pool = KVCachePool(
-        num_slots=batch, num_layers=1,
-        num_kv_heads=NUM_KV_HEADS, max_seq_len=MAX_SEQ,
+    # page_size=256 required by PagedKVPool; max_seq_len must be >= page_size.
+    pool = PagedKVPool(
+        num_seqs=batch, num_layers=1,
+        num_kv_heads=NUM_KV_HEADS, max_seq_len=256,
         head_dim=HEAD_DIM, device="cpu", dtype=torch.float32,
     )
     slot_a = pool.allocate("a")
     slot_b = pool.allocate("b")
+    pool.ensure_pages("a", 0)
+    pool.ensure_pages("b", 0)
     kv_be = pool.get_layer_view(0)
 
     attn = make_attn("sdpa", kv_backend=kv_be)
@@ -162,11 +166,13 @@ def test_batch_prefill_sdpa_fallback_with_kv_backend():
     k = torch.randn(batch, seq, NUM_KV_HEADS, HEAD_DIM)
     v = torch.randn_like(k)
     cu_q = torch.tensor([0, seq, seq * 2], dtype=torch.int32)
+    slot_ids = torch.tensor([slot_a, slot_b])
     set_context(
         is_prefill=True, cache_len=0,
-        slot_ids=torch.tensor([slot_a, slot_b]),
+        slot_ids=slot_ids,
         cache_lens=torch.tensor([0, 0]),
         cu_seqlens_q=cu_q,
+        block_tables=pool.block_table_for(slot_ids),
     )
     with patch("layers.attention._USE_FA_PREFILL", False):
         out = attn(q, k, v)

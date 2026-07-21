@@ -11,7 +11,7 @@ import sys
 import os
 
 # Ensure project root is on the path when run from scripts/
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 import torch
 import torch.distributed as dist

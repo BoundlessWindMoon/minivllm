@@ -15,7 +15,7 @@ model:
   backend: default
   megakernel_variant: default
   attention_backend: sdpa
-  use_cuda_graph: false
+  use_cuda_graph: true
   cuda_graph_bucket_size: 1
   use_quantized_model: false
   use_kvcache: true

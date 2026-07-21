@@ -37,25 +37,30 @@ from typing import TYPE_CHECKING
 from engine.request import Request, RequestStatus
 
 if TYPE_CHECKING:
-    from engine.kv_pool import KVCachePool
+    from engine.kv_pool import PagedKVPool
+    from engine.prefix_cache import PrefixCache
 
 
 class Scheduler:
 
     def __init__(
         self,
-        kv_pool: "KVCachePool",
+        kv_pool: "PagedKVPool",
         max_batch_size: int,
-        admission_policy: str = "fifo",          # "fifo" | "spf"
+        admission_policy: str = "fifo",
         max_num_batched_tokens: int | None = None,
+        prefix_cache: "PrefixCache | None" = None,
     ) -> None:
         self._pool                  = kv_pool
         self.max_batch_size         = max_batch_size
         self.admission_policy       = admission_policy
         self.max_num_batched_tokens = max_num_batched_tokens
+        self._prefix_cache          = prefix_cache
 
         self._waiting: list[Request] = []
         self._running: list[Request] = []
+        # Track which pages each running request borrowed from prefix cache.
+        self._req_prefix_pages: dict[str, list[int]] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -100,10 +105,22 @@ class Scheduler:
         admitted: list[Request] = []
         while new_budget > 0 and self._waiting and self._pool.num_free_slots() > 0:
             req = self._pop_next_waiting()
-            req.slot_id             = self._pool.allocate(req.request_id)
-            req.status              = RequestStatus.PREFILLING
-            req.first_scheduled_at  = time.perf_counter()
+
+            # Prefix cache lookup: find matching physical pages.
+            prefix_pages: list[int] = []
+            if self._prefix_cache is not None:
+                prefix_pages, req.cached_prefix_len = self._prefix_cache.lookup(
+                    req.prompt_token_ids, self._pool.page_size,
+                )
+
+            req.slot_id            = self._pool.allocate(req.request_id, prefix_pages)
+            req.status             = RequestStatus.PREFILLING
+            req.first_scheduled_at = time.perf_counter()
+            # Skip already-cached tokens: prefill starts from cached_prefix_len.
+            req.prefilled_len      = req.cached_prefix_len
+            req.cache_len          = req.cached_prefix_len
             self._running.append(req)
+            self._req_prefix_pages[req.request_id] = prefix_pages
             admitted.append(req)
             new_budget -= 1
 
@@ -135,6 +152,19 @@ class Scheduler:
 
     def on_request_finished(self, request: Request) -> None:
         self._running = [r for r in self._running if r.request_id != request.request_id]
+
+        if self._prefix_cache is not None:
+            pool = self._pool
+            if request.slot_id >= 0:
+                pages = pool.pages_for(request.request_id)
+                self._prefix_cache.insert(
+                    request.prompt_token_ids, pages, pool.page_size,
+                )
+            prefix_pages = self._req_prefix_pages.pop(request.request_id, [])
+            self._prefix_cache.release(prefix_pages)
+        else:
+            self._req_prefix_pages.pop(request.request_id, None)
+
         if request.slot_id >= 0:
             self._pool.free(request.slot_id)
 
